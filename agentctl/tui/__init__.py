@@ -5,8 +5,9 @@ buttons and a footer that only shows the keys that apply, for ~45 columns in Ter
 
 The transcript is one widget per entry, so text can be selected with the mouse (ctrl+c
 copies), replies render as Markdown, and each run of tool calls folds into one line.
-`v` mirrors the session's terminal with tappable keys, for prompts the transcript can't show
-(trust this folder?, update menus, pickers); `n` starts a session, `o` adopts, `x` closes."""
+Enter on a live session puts you in the agent itself (its tmux pane; ctrl-] d comes back), so
+typing, pasting, menus and prompts all work as they do there. Sessions without a pane open
+their transcript. `n` starts a session and opens it, `o` adopts, `x` closes."""
 
 import asyncio
 import contextlib
@@ -20,11 +21,13 @@ from datetime import datetime
 from typing import Any
 
 from rich.text import Text
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.screen import ModalScreen
+from textual.suggester import Suggester
 from textual.widgets import (
     Button,
     Collapsible,
@@ -34,6 +37,7 @@ from textual.widgets import (
     Markdown,
     OptionList,
     Static,
+    TextArea,
 )
 from textual.widgets.button import ButtonVariant
 from textual.widgets.option_list import Option
@@ -51,12 +55,6 @@ from agentctl.cli import (
     usage_text,
 )
 from agentctl.models import short_id
-
-# Screen-view keys: (label, tmux key). Ctrl-C is left out on purpose: `x` closes properly.
-SCREEN_KEYS = [
-    ("↑", "Up"), ("↓", "Down"), ("←", "Left"), ("→", "Right"), ("⏎", "Enter"),
-    ("esc", "Escape"), ("tab", "Tab"), ("1", "1"), ("2", "2"), ("3", "3"), ("y", "y"), ("n", "n"),
-]  # fmt: skip
 
 GROUPS = [
     ("awaiting_approval", "NEEDS APPROVAL"),
@@ -118,11 +116,10 @@ def card_text(r: dict[str, Any], folder: bool = True) -> Text:
     """Phone row: the title gets the whole first line; id, source, age, context, folder below."""
     approval = r["status"] == "awaiting_approval"
     t = Text(no_wrap=True, overflow="ellipsis")
-    t.append("● " if r["controllable"] else "· ", style="green" if r["controllable"] else "dim")
     t.append_text(badges(r))
     title_style = "bold yellow" if approval else "dim" if r["status"] == "ended" else "bold"
     t.append(r["title"] or short_cwd(r["cwd"]), style=title_style)
-    t.append(f"\n  {short_id(r['id'])} {SRC[r['source']]} {age(r['last_activity'])} ", style="dim")
+    t.append(f"\n{short_id(r['id'])} {SRC[r['source']]} {age(r['last_activity'])} ", style="dim")
     if r.get("context_tokens") is not None:
         t.append_text(ctx_text(r, short=True)).append(" ")
     if folder:
@@ -135,7 +132,6 @@ def card_text(r: dict[str, Any], folder: bool = True) -> Text:
 def row_text(r: dict[str, Any]) -> Text:
     approval = r["status"] == "awaiting_approval"
     t = Text(no_wrap=True, overflow="ellipsis")
-    t.append("● " if r["controllable"] else "· ", style="green" if r["controllable"] else "dim")
     t.append(short_id(r["id"]), style="bold yellow" if approval else "bold")
     t.append(f" {SRC[r['source']]} ", style="dim")
     t.append(f"{age(r['last_activity']):>3} ", style="dim")
@@ -146,6 +142,41 @@ def row_text(r: dict[str, Any]) -> Text:
 
 
 TOOL_KINDS = ("tool_call", "tool_result", "status_change")
+
+
+class Prompt(TextArea):
+    """Message box. Enter submits; a paste keeps its newlines (Textual's Input keeps only the
+    first line of a paste, which silently cut multi-line messages). New line: shift/alt+enter,
+    ctrl+j, or `\\` then enter (phones have no shift+enter). TextArea brings the rest: ctrl+a/e/
+    w/u/k, undo, selection."""
+
+    BINDINGS = [
+        Binding("shift+enter,alt+enter,ctrl+j", "newline", show=False),
+        Binding("alt+left,alt+b", "cursor_word_left", show=False),
+        Binding("alt+right,alt+f", "cursor_word_right", show=False),
+        Binding("super+left", "cursor_line_start", show=False),
+        Binding("super+right", "cursor_line_end", show=False),
+    ]
+
+    class Submitted(Message):
+        def __init__(self, value: str) -> None:
+            super().__init__()
+            self.value = value
+
+    def action_newline(self) -> None:
+        self.insert("\n")
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.prevent_default()
+            event.stop()
+            row, col = self.cursor_location
+            if col and self.document.get_line(row)[col - 1] == "\\":
+                self.replace("\n", (row, col - 1), (row, col))
+            else:
+                self.post_message(self.Submitted(self.text))
+        else:
+            await super()._on_key(event)
 
 
 class Transcript(VerticalScroll):
@@ -167,7 +198,7 @@ class Transcript(VerticalScroll):
         self.group: Collapsible | None = None
         self.body = Vertical()
         self.tools: Counter[str] = Counter()
-        self.group_ts, self.first, self.failed = "", "", 0
+        self.group_ts, self.latest, self.failed = "", "", 0
         self.last_reply = ""  # for `c`
         self.seen_at: str | None = None
         self.any = False
@@ -193,12 +224,12 @@ class Transcript(VerticalScroll):
                 self.body = Vertical()
                 self.group = Collapsible(self.body, collapsed=True)
                 self.tools.clear()
-                self.group_ts = fmt_ts(ev["ts"], self.narrow)
-                self.first, self.failed = "", 0
+                self.failed = 0
                 self.mount(self.group)
-            if kind == "tool_call":
+            if kind == "tool_call":  # the folded line follows the newest call, so it visibly moves
                 self.tools[p["name"]] += 1
-                self.first = self.first or (p["summary"].splitlines() or [""])[0]
+                self.latest = f"{p['name']} {(p['summary'].splitlines() or [''])[0]}"
+                self.group_ts = fmt_ts(ev["ts"], self.narrow)
             self.failed += bool(kind == "tool_result" and p.get("is_error"))
             line = Static(render(ev, narrow=True))
             if self.body.is_mounted:
@@ -220,12 +251,12 @@ class Transcript(VerticalScroll):
     def group_title(self) -> Text:
         n = sum(self.tools.values())
         t = Text(f"{self.group_ts} ", style="dim")
-        if n == 1:
-            name = next(iter(self.tools))
-            t.append(f"⚙ {name} ", style="yellow").append(self.first[:120], style="dim")
+        name, _, rest = self.latest.partition(" ")
+        if n > 1:
+            t.append(f"⚙ {n} tools · last ", style="yellow")
         else:
-            names = ", ".join(f"{k} ×{v}" if v > 1 else k for k, v in self.tools.most_common())
-            t.append(f"⚙ {n} tools ", style="yellow").append(names, style="dim")
+            t.append("⚙ ", style="yellow")
+        t.append(f"{name} ", style="yellow").append(rest[:120], style="dim")
         if self.failed:
             t.append(f" · {self.failed} failed", style="red")
         return t
@@ -237,7 +268,8 @@ def fmt_ts(iso: str, narrow: bool) -> str:
 
 HELP = """\
 [b]list[/b]
-  enter / tap   open a session
+  enter / tap   open a session: jump into it (ctrl-] d comes back)
+  space         its transcript, without jumping in
   a  d  1-4     approve, deny, pick an option
   n             new session
   u             what's new since you last looked
@@ -250,12 +282,10 @@ HELP = """\
   s             send a message
   l             queue a message for when it's free
   i             interrupt the running turn
-  v             its terminal, live, with tappable keys
-  c             copy the last reply (in v: the screen)
+  c             copy the last reply
   r             rename (agentctl's own name for it)
   o             adopt: move it into agentctl
   x             close it (stays resumable)
-  t             attach to its terminal (ctrl-] d returns)
   m             replies as raw text / Markdown
   esc           back
 
@@ -321,10 +351,6 @@ class Digest(ModalScreen[str | None]):
         self.dismiss(event.option.id)
 
 
-class KeyButton(Button, can_focus=False):
-    """Tapping a key mustn't take focus from the session (Esc would stop working)."""
-
-
 class Confirm(ModalScreen[bool]):
     """Yes/no dialog with big tap targets."""
 
@@ -353,8 +379,49 @@ class Confirm(ModalScreen[bool]):
         self.dismiss(event.button.id == "yes")
 
 
+def dir_matches(value: str, limit: int = 8) -> list[str]:
+    """Folders completing a typed path, in the form typed (`~` kept). Dot-folders only when
+    the typed name starts with a dot."""
+    if "/" not in value:
+        return []
+    head, _, part = value.rpartition("/")
+    try:
+        with os.scandir(os.path.expanduser(head or "/")) as it:
+            names = sorted(
+                e.name
+                for e in it
+                if e.name.startswith(part)
+                and (part.startswith(".") or not e.name.startswith("."))
+                and e.is_dir()
+            )
+    except OSError:
+        return []
+    return [f"{head}/{n}" for n in names[:limit]]
+
+
+class DirSuggester(Suggester):
+    def __init__(self) -> None:
+        super().__init__(use_cache=False, case_sensitive=True)
+
+    async def get_suggestion(self, value: str) -> str | None:
+        m = await asyncio.to_thread(dir_matches, value, 1)
+        return m[0] if m else None
+
+
+class FolderInput(Input):
+    """tab (or →) takes the grey completion and goes into it, so tab tab tab walks down."""
+
+    BINDINGS = [Binding("tab", "complete", show=False)]
+
+    def action_complete(self) -> None:
+        if self._suggestion and len(self._suggestion) > len(self.value):
+            self.value = self._suggestion + "/"
+            self.cursor_position = len(self.value)
+
+
 class NewSession(ModalScreen[tuple[str, str] | None]):
-    """Pick an agent and a folder (recent ones listed) to start a session in."""
+    """Pick an agent and a folder to start a session in. The list under the folder shows
+    recent folders, then the folders matching what's typed; tap one to fill it in."""
 
     DEFAULT_CSS = """
     NewSession { align: center middle; }
@@ -362,7 +429,7 @@ class NewSession(ModalScreen[tuple[str, str] | None]):
                             border: round $accent; padding: 0 1; background: $surface; }
     NewSession .row { height: auto; }
     NewSession .row Button { width: 1fr; min-width: 0; }
-    NewSession OptionList { height: auto; max-height: 10; border: none; }
+    NewSession OptionList { height: 8; border: none; }  /* fixed: taps can't miss as it fills */
     NewSession Static { margin-top: 1; }
     """
     BINDINGS = [Binding("escape", "dismiss(None)", "cancel")]
@@ -381,9 +448,9 @@ class NewSession(ModalScreen[tuple[str, str] | None]):
                         a, id=f"agent-{a}", variant="primary" if a == self.agent else "default"
                     )
             yield Static("folder")
-            yield Input(value=tilde(self.folders[0]) if self.folders else "~", id="folder")
-            if self.folders:
-                yield OptionList(*[tilde(f) for f in self.folders], id="recent")
+            start = tilde(self.folders[0]) if self.folders else "~/"
+            yield FolderInput(value=start, id="folder", suggester=DirSuggester())
+            yield OptionList(*[tilde(f) for f in self.folders], id="recent")
             with Horizontal(classes="row"):
                 yield Button("Start", id="start", variant="success")
                 yield Button("Cancel", id="cancel")
@@ -401,13 +468,29 @@ class NewSession(ModalScreen[tuple[str, str] | None]):
         else:
             self.dismiss(None)
 
+    def on_mount(self) -> None:
+        self.query_one("#folder", Input).focus()
+
+    @on(Input.Changed, "#folder")
+    async def typed(self, event: Input.Changed) -> None:
+        recent = [tilde(f) for f in self.folders]
+        v = event.value
+        shown = recent if v in recent else await asyncio.to_thread(dir_matches, v)
+        ol = self.query_one("#recent", OptionList)
+        if [str(ol.get_option_at_index(i).prompt) for i in range(ol.option_count)] != shown:
+            ol.set_options(shown)
+
     @on(OptionList.OptionSelected, "#recent")
     def recent(self, event: OptionList.OptionSelected) -> None:
-        self.query_one("#folder", Input).value = str(event.option.prompt)
+        inp = self.query_one("#folder", Input)
+        inp.value = str(event.option.prompt) + "/"
+        inp.cursor_position = len(inp.value)
+        inp.focus()
 
     @on(Input.Submitted, "#folder")
     def start(self) -> None:
-        folder = os.path.expanduser(self.query_one("#folder", Input).value.strip())
+        folder = os.path.expanduser(self.query_one("#folder", Input).value.strip()).rstrip("/")
+        folder = folder or "/"
         if not os.path.isdir(folder):
             self.notify(f"not a folder: {folder}", severity="error")
         elif self.agent:
@@ -423,48 +506,42 @@ class Watch(App[None]):
     TITLE = "agentctl"
     CSS = """
     #main { height: 1fr; }
-    #list { width: 45%; min-width: 36; border: none; padding: 0;
-            text-wrap: nowrap; text-overflow: ellipsis; }
+    #left { width: 45%; min-width: 36; }
+    #list, #feed { border: none; padding: 0; text-wrap: nowrap; text-overflow: ellipsis; }
+    #list { height: auto; max-height: 65%; }
+    #feed-title { color: $text-muted; text-style: bold; padding: 0 1; border-top: solid $panel; }
+    #feed { height: 1fr; }
     #detail { width: 1fr; }
     #header { height: auto; }
     #log { height: 1fr; }
-    #prompt { display: none; }
+    #prompt { display: none; height: auto; max-height: 8; }
     #prompt.show { display: block; }
     #actions { height: auto; display: none; }
     #actions.show { display: block; }
     #actions Button { width: 1fr; height: 1; min-width: 0; border: none; margin: 0 0 0 0; }
-    #screen { height: 1fr; display: none; overflow-x: auto; }
-    #screen-text { width: auto; }
-    #keys { height: auto; display: none; layout: grid; grid-size: 12; grid-gutter: 0 1; }
-    .narrow #keys { grid-size: 6; }
-    #keys Button { width: 1fr; min-width: 0; height: 1; border: none; }
-    .screen-view #log { display: none; }
-    .screen-view #screen { display: block; }
-    .screen-view #keys { display: block; }
-    .narrow #list { width: 1fr; min-width: 0; }
+    .narrow #left { width: 1fr; min-width: 0; }
     .narrow #detail { display: none; }
-    .narrow.detail-view #list { display: none; }
+    .narrow.detail-view #left { display: none; }
     .narrow.detail-view #detail { display: block; }
     """
     BINDINGS = [
         Binding("j", "down", "down", show=False),
         Binding("k", "up", "up", show=False),
         Binding("enter", "open", "open"),
+        Binding("space", "log", "log"),
         Binding("escape", "leave", "back"),
-        Binding("s", "send", "send"),
         Binding("a", "approve", "yes"),
         Binding("d", "deny", "no"),
+        Binding("s", "send", "send"),
         Binding("i", "interrupt", "stop"),
-        Binding("v", "toggle_screen", "screen"),
-        Binding("t", "attach", "tmux"),
         Binding("o", "adopt", "adopt"),
-        Binding("x", "close", "close"),
         Binding("n", "new", "new"),
         Binding("/", "filter", "find"),
-        Binding("e", "toggle_ended", "ended"),
+        Binding("x", "close", "close", show=False),
+        Binding("e", "toggle_ended", "ended", show=False),
         Binding("b", "toggle_notify", "bell", show=False),
         Binding("c", "copy", "copy", show=False),
-        Binding("l", "later", "later"),
+        Binding("l", "later", "later", show=False),
         Binding("u", "digest", "new", show=False),
         Binding("p", "toggle_projects", "projects", show=False),
         Binding("r", "rename", "rename", show=False),
@@ -483,7 +560,6 @@ class Watch(App[None]):
     ) -> None:
         super().__init__()
         self.agents = agents  # installed agents, found on first `n`
-        self.screen_text = ""  # last screen-view capture, for `c`
         self.by_project = False  # `p`: group the list by project instead of status
         self.usage = ""
         self.conflicts: set[tuple[str, str]] | None = None
@@ -503,17 +579,15 @@ class Watch(App[None]):
     def compose(self) -> ComposeResult:
         yield Header(icon="◆")
         with Horizontal(id="main"):
-            yield OptionList(id="list")
+            with Vertical(id="left"):
+                yield OptionList(id="list")
+                yield Static("RECENT", id="feed-title")
+                yield OptionList(id="feed")
             with Vertical(id="detail"):
                 yield Static(id="header")
                 yield Transcript(id="log")
-                with VerticalScroll(id="screen"):
-                    yield Static(id="screen-text")
-                with Horizontal(id="keys"):
-                    for label, key in SCREEN_KEYS:
-                        yield KeyButton(label, name=key, id=f"key-{key}")
                 yield Vertical(id="actions")
-        yield Input(id="prompt")
+        yield Prompt(id="prompt", soft_wrap=True, show_line_numbers=False)
         yield Footer(compact=True, show_command_palette=False)
 
     async def on_mount(self) -> None:
@@ -522,7 +596,6 @@ class Watch(App[None]):
         self.set_interval(1.0, self.poll)
         await self.poll_usage()
         self.set_interval(30.0, self.poll_usage)
-        self.set_interval(1.0, self.refresh_screen)
         self.query_one("#list", OptionList).focus()
 
     @property
@@ -546,20 +619,18 @@ class Watch(App[None]):
         live = bool(r and r["controllable"] and r["status"] != "ended")
         if action in ("approve", "deny", "choose"):
             return bool(r and r["status"] == "awaiting_approval")
-        if action == "open":
-            return not detail
+        if action == "open":  # in the transcript, only jumping in is left to do
+            return r is not None and (not (self.narrow and detail) or bool(r["tmux_pane"]))
+        if action == "log":
+            return r is not None and self.narrow and not detail
         if action == "leave":
             return bool(self.prompt_mode) or (self.narrow and detail)
         if action in ("filter", "toggle_ended"):
             return not detail or not self.narrow
-        if action == "send":
-            return live and detail
+        if action == "send":  # outside agentctl too: action_send says how to get it in
+            return bool(r and r["status"] != "ended")
         if action == "interrupt":
-            return live and detail and bool(r and r["status"] == "working")
-        if action == "attach":
-            return detail and bool(r and r["tmux_pane"])
-        if action == "toggle_screen":
-            return detail and bool(r and r["tmux_pane"])
+            return live and bool(r and r["status"] == "working")
         if action == "adopt":
             return detail and bool(r and not r["controllable"])
         if action == "close":
@@ -567,7 +638,7 @@ class Watch(App[None]):
         if action == "new":
             return not detail or not self.narrow
         if action == "later":
-            return live and detail and bool(r and r["status"] in ("working", "awaiting_approval"))
+            return live and bool(r and r["status"] in ("working", "awaiting_approval"))
         if action in ("digest", "toggle_projects"):
             return not detail or not self.narrow
         if action in ("copy", "rename"):
@@ -603,6 +674,8 @@ class Watch(App[None]):
         self.announce(rows)
         self.rows = rows
         self.rebuild()
+        with contextlib.suppress(Exception):
+            self.show_feed(await self.rpc("feed"))
         r = self.current()
         if r and r.get("unread") and (not self.narrow or self.screen.has_class("detail-view")):
             with contextlib.suppress(Exception):
@@ -683,6 +756,31 @@ class Watch(App[None]):
             self.query_one("#header", Static).update(session_header(row, compact=self.narrow))
         self.update_actions(row)
         self.refresh_bindings()
+
+    def show_feed(self, items: list[dict[str, Any]]) -> None:
+        """What's happening across sessions, newest first; tap a line to read that session."""
+        icon = {"reply": ("◆", "green"), "you": ("›", "cyan"), "now": ("⚙", "yellow"),
+                "approval": ("⚠ needs approval", "bold yellow")}  # fmt: skip
+        opts = []
+        for i, it in enumerate(items):
+            t = Text(no_wrap=True, overflow="ellipsis")
+            t.append(fmt_ts(it["ts"], True) + " ", style="dim")
+            t.append(it["title"][:18] + " ", style="bold")
+            mark, style = icon[it["kind"]]
+            t.append(mark + " ", style=style).append(it["text"], style="dim")
+            opts.append(Option(t, id=f"{i}|{it['id']}"))  # one session can have several lines
+        ol = self.query_one("#feed", OptionList)
+        if [str(o.prompt) for o in opts] != [
+            str(ol.get_option_at_index(i).prompt) for i in range(ol.option_count)
+        ]:
+            ol.set_options(opts)
+
+    @on(OptionList.OptionSelected, "#feed")
+    def feed_selected(self, event: OptionList.OptionSelected) -> None:
+        sid = (event.option.id or "").split("|", 1)[1]
+        self.select(sid)
+        self.rebuild()
+        self.action_log()
 
     def project_options(self, rows: list[dict[str, Any]]) -> list[Option]:
         """The list grouped by project (git repo, else folder): projects with sessions that
@@ -783,8 +881,17 @@ class Watch(App[None]):
         elif isinstance(w, Transcript):
             w.scroll_up()
 
-    @on(OptionList.OptionSelected)
-    def action_open(self) -> None:
+    @on(OptionList.OptionSelected, "#list")  # not the lists in dialogs
+    async def action_open(self) -> None:
+        r = self.current()
+        if r and r["tmux_pane"]:
+            await self.action_attach()
+        elif r and not r["controllable"] and r["status"] != "ended":
+            self.action_adopt()  # open in another terminal: offer to move it here
+        else:
+            self.action_log()
+
+    def action_log(self) -> None:
         if self.selected:
             self.screen.add_class("detail-view")
             self.query_one("#log", Transcript).focus()
@@ -794,10 +901,6 @@ class Watch(App[None]):
         if self.prompt_mode:
             self.close_prompt(clear_filter=self.prompt_mode == "filter")
             return
-        if self.screen.has_class("screen-view"):  # screen view -> transcript
-            self.screen.remove_class("screen-view")
-            self.refresh_bindings()
-            return
         self.screen.remove_class("detail-view")
         self.query_one("#list", OptionList).focus()
         self.refresh_bindings()
@@ -806,8 +909,10 @@ class Watch(App[None]):
 
     def open_prompt(self, mode: str, placeholder: str, value: str = "") -> None:
         self.prompt_mode = mode
-        inp = self.query_one("#prompt", Input)
-        inp.placeholder, inp.value = placeholder, value
+        inp = self.query_one("#prompt", Prompt)
+        inp.placeholder = placeholder
+        inp.load_text(value)
+        inp.move_cursor(inp.document.end)
         inp.add_class("show")
         inp.focus()
 
@@ -817,12 +922,21 @@ class Watch(App[None]):
             self.rebuild()
             self.update_subtitle()
         self.prompt_mode = None
-        self.query_one("#prompt", Input).remove_class("show")
+        self.query_one("#prompt", Prompt).remove_class("show")
         target = "#log" if self.screen.has_class("detail-view") else "#list"
         self.query_one(target).focus()
 
+    def outside(self) -> bool:
+        """Not something agentctl can type into: say how to fix that rather than do nothing."""
+        r = self.current()
+        if r and not r["controllable"]:
+            msg = f"{short_id(r['id'])} runs outside agentctl: enter moves it here"
+            self.notify(msg, timeout=5)
+            return True
+        return False
+
     def action_send(self) -> None:
-        if self.selected:
+        if self.selected and not self.outside():
             self.open_prompt(
                 "send", f"message to {short_id(self.selected)} · enter sends · esc cancels"
             )
@@ -830,15 +944,15 @@ class Watch(App[None]):
     def action_filter(self) -> None:
         self.open_prompt("filter", "filter by id, title or folder · esc clears", self.filter)
 
-    @on(Input.Changed, "#prompt")
-    def filter_changed(self, event: Input.Changed) -> None:
+    @on(TextArea.Changed, "#prompt")
+    def filter_changed(self, event: TextArea.Changed) -> None:
         if self.prompt_mode == "filter":
-            self.filter = event.value
+            self.filter = event.text_area.text
             self.rebuild()
             self.update_subtitle()
 
-    @on(Input.Submitted, "#prompt")
-    async def prompt_submitted(self, event: Input.Submitted) -> None:
+    @on(Prompt.Submitted)
+    async def prompt_submitted(self, event: Prompt.Submitted) -> None:
         mode = self.prompt_mode
         self.close_prompt()
         if mode == "send" and event.value.strip():
@@ -855,12 +969,14 @@ class Watch(App[None]):
             return
         try:
             r = await self.rpc(method, id=self.selected, **params)
+            if "queued" in r:
+                method = "queue"
             done = r.get("chosen") or {
                 "send": "sent",
                 "interrupt": "interrupted",
                 "close": "closed",
                 "rename": "renamed",
-                "queue": "queued for when it's free",
+                "queue": f"busy: queued ({len(r.get('queued') or [])} waiting)",
             }.get(method, method)
             self.notify(f"✓ {short_id(self.selected)} {done}", timeout=3)
         except Exception as e:
@@ -881,47 +997,11 @@ class Watch(App[None]):
     async def action_interrupt(self) -> None:
         await self.control("interrupt")
 
-    # --- screen view ---
-
-    async def action_toggle_screen(self) -> None:
-        on = not self.screen.has_class("screen-view")
-        self.screen.set_class(on, "screen-view")
-        self.refresh_bindings()
-        if on:
-            await self.refresh_screen()
-
-    async def refresh_screen(self) -> None:
-        if not self.selected or not self.screen.has_class("screen-view"):
-            return
-        box = self.query_one("#screen", VerticalScroll)
-        at_end = box.is_vertical_scroll_end or box.max_scroll_y == 0
-        try:
-            r = await self.rpc("screen", id=self.selected)
-            text = Text.from_ansi(r["screen"], no_wrap=True)
-        except Exception as e:
-            text = Text(f"can't show its screen: {e}", style="dim")
-        self.screen_text = text.plain
-        self.query_one("#screen-text", Static).update(text)
-        if at_end:
-            box.call_after_refresh(box.scroll_end, animate=False)
-
-    @on(Button.Pressed, "#keys Button")
-    async def key_pressed(self, event: Button.Pressed) -> None:
-        if self.selected and event.button.name:
-            try:
-                await self.rpc("keys", id=self.selected, keys=[event.button.name])
-            except Exception as e:
-                self.notify(str(e), severity="error", timeout=6)
-            self.set_timer(0.15, self.refresh_screen)  # once the agent has redrawn
-
     # --- copy / rename / help ---
 
     def action_copy(self) -> None:
         """OSC 52: lands in the clipboard of the terminal showing this, e.g. the phone's."""
-        if self.screen.has_class("screen-view"):
-            text, what = self.screen_text, "screen"
-        else:
-            text, what = self.query_one("#log", Transcript).last_reply, "last reply"
+        text, what = self.query_one("#log", Transcript).last_reply, "last reply"
         if not text:
             self.notify(f"no {what} to copy", timeout=3)
             return
@@ -947,7 +1027,7 @@ class Watch(App[None]):
         if sid:
             self.select(sid)
             self.rebuild()
-            self.action_open()
+            self.action_log()  # came to read what's new
 
     def action_rename(self) -> None:
         r = self.current()
@@ -981,11 +1061,24 @@ class Watch(App[None]):
         except Exception as e:
             self.notify(str(e), severity="error", timeout=10)
             return
+        await self.jump(r["socket"], r["pane"])
+
+    async def jump(self, sock: str | None, pane: str) -> None:
+        """Into the agent's pane until ctrl-] d (or it exits), then back here on that session.
+        In the ctrl-] w popup the agent is under the popup: close it instead."""
+        from agentctl.cli import _attach
+
+        popup = os.environ.get("TMUX", "").split(",")[0] == sock
+        with self.suspend():
+            _attach(sock, pane)
+        if popup:
+            self.exit()
+            return
         await self.poll()
-        self.select(r["session_id"])
-        self.action_open()
-        hint = "send it a first message (s)" if agent != "claude" else "v shows its screen"
-        self.notify(f"✓ started {agent} in {tilde(folder)} · {hint}", timeout=6)
+        row = next((r for r in self.rows if r["tmux_pane"] == pane), None)
+        if row:
+            self.select(row["id"])
+            self.rebuild()
 
     @work
     async def action_adopt(self) -> None:
@@ -1036,13 +1129,7 @@ class Watch(App[None]):
         except Exception as e:
             self.notify(str(e), severity="error", timeout=8)
             return
-        tm = [shutil.which("tmux") or "tmux", *(["-S", r["socket"]] if r["socket"] else [])]
-        pane = r["pane"]
-        with self.suspend():
-            subprocess.run([*tm, "select-window", "-t", pane], check=False)
-            subprocess.run([*tm, "select-pane", "-t", pane], check=False)
-            verb = "switch-client" if os.environ.get("TMUX") else "attach-session"
-            subprocess.run([*tm, verb, "-t", pane], check=False)
+        await self.jump(r["socket"], r["pane"])
 
 
 def mac_notify(msg: str) -> None:

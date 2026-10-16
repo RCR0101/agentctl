@@ -294,3 +294,16 @@ def test_statusline_gives_exact_numbers_and_limits(tmp_path: Path) -> None:
         ("5h", 41.5),
         ("week", 0.0),  # its reset time has passed
     ]
+
+
+def test_claude_limits_survive_a_restart(tmp_path: Path) -> None:
+    root = tmp_path / ".claude"
+    (root / "projects").mkdir(parents=True)
+    (root / "sessions").mkdir()
+    db = str(tmp_path / "state.db")
+    soon = int(time.time()) + 3600
+    a = ClaudeCodeAdapter(Registry(Bus()), root=root, store=Store(db))
+    a.on_statusline({"rate_limits": {"five_hour": {"used_percentage": 18, "resets_at": soon}}})
+    b = ClaudeCodeAdapter(Registry(Bus()), root=root, store=Store(db))  # daemon restarted
+    u = b.usage()
+    assert u and u["windows"][0]["used_percent"] == 18

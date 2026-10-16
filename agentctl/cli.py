@@ -257,11 +257,11 @@ def session_header(s: dict[str, Any], compact: bool = False) -> Panel | Group:
     meta.append_text(status_text(s["status"])).append("  ")
     meta.append(f"{s['source']} · {s['origin']} · ", style="dim")
     if s["tmux_pane"]:
-        meta.append("● controllable", style="green").append(" · in tmux", style="dim")
+        meta.append("in agentctl", style="dim")
     elif s["controllable"]:
-        meta.append("● controllable", style="green").append(" · via codex app-server", style="dim")
+        meta.append("via codex app-server", style="dim")
     else:
-        meta.append("read-only", style="dim")
+        meta.append("outside agentctl", style="dim")
     cwd = s["cwd"].replace(str(HOME), "~", 1)
     path = Text(cwd, style="dim", no_wrap=True, overflow="ellipsis")
     usage = Text()
@@ -436,11 +436,20 @@ def send(
     message: Annotated[str, typer.Argument(help='Text to send, or "-" to read stdin.')],
     when_idle: Annotated[
         bool,
-        typer.Option("--when-idle", "-l", help="Queue it; it's sent once the agent is free."),
+        typer.Option("--when-idle", "-l", help="Queue it even if the agent is free now."),
+    ] = False,
+    now: Annotated[
+        bool,
+        typer.Option(
+            "--now",
+            help="Send even mid-turn (Claude: queued in its own input; "
+            "Codex: steers the running turn).",
+        ),
     ] = False,
     as_json: JsonOpt = False,
 ) -> None:
-    """Type a message into a session and press Enter (or queue it for when it's free)."""
+    """Type a message into a session and press Enter. If it's mid-turn, the message is queued
+    and sent once the agent is free (--now sends it anyway)."""
     text = sys.stdin.read().rstrip("\n") if message == "-" else message
     if not text.strip():
         fail("empty message", as_json)
@@ -449,7 +458,11 @@ def send(
         n = len(r["queued"])
         ok(f"queued for {short_id(r['session_id'])} ({n} waiting)", as_json, r)
         return
-    r = rpc("send", as_json, id=id, text=text)
+    r = rpc("send", as_json, id=id, text=text, now=now)
+    if "queued" in r:
+        n = len(r["queued"])
+        ok(f"{short_id(r['session_id'])} is busy: queued ({n} waiting)", as_json, r)
+        return
     lines = text.count("\n") + 1
     ok(
         f"sent to {short_id(r['session_id'])}" + (f" ({lines} lines)" if lines > 1 else ""),
@@ -622,9 +635,10 @@ def opencode(ctx: typer.Context) -> None:
     _foreground("opencode", list(ctx.args))
 
 
-# Undo what a TUI killed by a signal can leave on: kitty keyboard flags, bracketed paste,
-# mouse reporting, hidden cursor. Unknown sequences are ignored by terminals.
-TTY_RESET = "\x1b[<u\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h"
+# Undo what a TUI killed by a signal can leave on: kitty keyboard flags, mouse reporting,
+# hidden cursor. Unknown sequences are ignored by terminals. Bracketed paste stays on: this is
+# written after the shell's prompt, and zsh/bash turn it on for that prompt themselves.
+TTY_RESET = "\x1b[<u\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h"
 
 
 def _proc(pid: int) -> tuple[str, str]:
@@ -724,10 +738,14 @@ def adopt_run(plan: AdoptPlan) -> dict[str, Any]:
                 break
         else:
             raise AdoptError(f"pid {pid} is still running; stop it yourself, then retry")
+        time.sleep(0.3)  # let the shell print its prompt
         with contextlib.suppress(OSError):  # tell the old terminal where the session went
             with open(f"/dev/{plan.tty}", "w") as t:
-                note = f"[agentctl] moved; open it with: agentctl attach {short}"
-                t.write(f"{TTY_RESET}\r\n{note}\r\n")
+                # Claude/Codex clear their screen on exit, so the line above the fresh prompt is
+                # the command that started them. Put the note there and leave the cursor at the
+                # prompt: written below it, the terminal looked like it was still waiting.
+                note = f"[agentctl] {short} moved into agentctl: agentctl attach {short}"
+                t.write(f"{TTY_RESET}\0337\033[A\r\033[2K{note}\0338")
         deadline = time.monotonic() + 6
         while call("holder", id=s["id"])["pid"] and time.monotonic() < deadline:
             time.sleep(0.2)  # until the daemon sees it's released (Codex: its writer lock)
@@ -836,8 +854,8 @@ def usage(as_json: JsonOpt = False) -> None:
     for key, name in (("claude", "Claude Code"), ("codex", "Codex")):
         lim = u.get(key)
         if not lim:
-            how = "hooks install wraps its status line" if key == "claude" else "a Codex reply"
-            out.print(Text(f"{name}: nothing reported yet (needs {how})", style="dim"))
+            how = "a Claude session's status line redraws" if key == "claude" else "Codex replies"
+            out.print(Text(f"{name}: nothing reported yet (it updates when {how})", style="dim"))
             continue
         plan = f" ({lim['plan']})" if lim.get("plan") else ""
         out.print(Text(f"{name}{plan}", style="bold"))

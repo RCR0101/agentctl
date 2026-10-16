@@ -130,3 +130,37 @@ def test_new_rollout_without_prompt_yet(tmp_path: Path) -> None:
     a = CodexAdapter(reg, root=tmp_path, exe="/usr/bin/false")
     a.open_rollout(p, startup=False)  # used to raise IndexError and kill the watcher
     assert reg.sessions and next(iter(reg.sessions.values())).title is None
+
+
+def test_limits_survive_an_empty_bucket_report(tmp_path: Path) -> None:
+    """Codex also reports other buckets ("premium") with no windows; the newest report of any
+    kind used to replace the real 5h/week numbers with nothing."""
+    import time as _time
+
+    from agentctl.adapters.codex import Rollout, parse_rollout
+    from agentctl.daemon.bus import Bus
+    from agentctl.daemon.registry import Registry
+
+    reset = int(_time.time()) + 3600
+    main = {
+        "limit_id": "codex",
+        "plan_type": "plus",
+        "primary": {"used_percent": 99.0, "window_minutes": 300, "resets_at": reset},
+        "secondary": {"used_percent": 43.0, "window_minutes": 10080, "resets_at": reset},
+    }
+    empty = {"limit_id": "premium", "plan_type": "plus", "primary": None, "secondary": None}
+    r = Rollout(path=tmp_path / "r.jsonl", tid="t1")
+    for ts, rl in (("2026-10-16T06:38:53.5Z", main), ("2026-10-16T06:38:53.9Z", empty)):
+        line = {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {}, "rate_limits": rl},
+        }
+        parse_rollout(line, r)
+    a = CodexAdapter(Registry(Bus()), root=tmp_path, exe="/usr/bin/false")
+    a.rollouts["t1"] = r
+    lim = a.limits()
+    assert lim and [(w["name"], w["used_percent"]) for w in lim["windows"]] == [
+        ("5h", 99.0),
+        ("week", 43.0),
+    ]

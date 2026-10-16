@@ -12,7 +12,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -124,7 +124,8 @@ class Rollout(FileTail):
     first_prompt: str | None = None
     last_kind: str | None = None  # working | done | interrupted
     context: int | None = None
-    limits: tuple[datetime, dict[str, Any]] | None = None  # newest token_count rate_limits
+    # newest token_count rate_limits per bucket ("codex", "premium", ...)
+    limits: dict[str, tuple[datetime, dict[str, Any]]] = field(default_factory=dict)
     window: int | None = None
 
 
@@ -150,7 +151,9 @@ def parse_rollout(d: dict[str, Any], r: Rollout) -> list[SessionEvent]:
             r.context = (info.get("last_token_usage") or {}).get("input_tokens", r.context)
             r.window = info.get("model_context_window") or r.window
             if isinstance(p.get("rate_limits"), dict):
-                r.limits = (ts, p["rate_limits"])
+                rl = p["rate_limits"]
+                if rl.get("primary") or rl.get("secondary"):  # some buckets report no windows
+                    r.limits[str(rl.get("limit_id") or "codex")] = (ts, rl)
         elif et == "item_completed" and r.paginated:
             evs = item_events(p.get("item") or {}, r.tid, ts)
             if r.first_prompt is None and evs and evs[0].payload.get("role") == "user":
@@ -497,25 +500,32 @@ class CodexAdapter:
                 self.not_in_tmux.add(pid)
 
     def limits(self) -> dict[str, Any] | None:
-        """Your Codex plan's usage windows, from the newest rollout that reported them:
+        """Your Codex plan's usage windows: the newest report of each limit bucket ("codex" is
+        the main one; others are prefixed, e.g. "premium 5h"):
         {"plan", "at", "windows": [{"name", "used_percent", "resets_at"}]}. A window whose
         reset time has passed is reported as 0% used."""
-        newest = max((r.limits for r in self.rollouts.values() if r.limits), default=None,
-                     key=lambda x: x[0])  # fmt: skip
+        newest: dict[str, tuple[datetime, dict[str, Any]]] = {}
+        for r in self.rollouts.values():
+            for bucket, (ts, rl) in r.limits.items():
+                if bucket not in newest or ts > newest[bucket][0]:
+                    newest[bucket] = (ts, rl)
         if not newest:
             return None
-        at, rl = newest
         now = time.time()
         windows = []
-        for key in ("primary", "secondary"):
-            w = rl.get(key) or {}
-            if not w:
-                continue
-            mins = w.get("window_minutes") or 0
-            name = "5h" if mins == 300 else "week" if mins == 10080 else f"{mins // 60}h"
-            reset = w.get("resets_at") or 0
-            used = 0.0 if reset and reset < now else float(w.get("used_percent") or 0)
-            windows.append({"name": name, "used_percent": used, "resets_at": reset})
+        for bucket in sorted(newest, key=lambda b: b != "codex"):  # the main bucket first
+            rl = newest[bucket][1]
+            for key in ("primary", "secondary"):
+                w = rl.get(key) or {}
+                if not w:
+                    continue
+                mins = w.get("window_minutes") or 0
+                name = "5h" if mins == 300 else "week" if mins == 10080 else f"{mins // 60}h"
+                name = name if bucket == "codex" else f"{bucket} {name}"
+                reset = w.get("resets_at") or 0
+                used = 0.0 if reset and reset < now else float(w.get("used_percent") or 0)
+                windows.append({"name": name, "used_percent": used, "resets_at": reset})
+        at, rl = max(newest.values(), key=lambda x: x[0])
         return {"plan": rl.get("plan_type"), "at": at.isoformat(), "windows": windows}
 
     def holder(self, tid: str) -> int | None:

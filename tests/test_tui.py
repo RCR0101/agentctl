@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
+from textual import events
 from textual.widgets import Button, OptionList, Static
 
 from agentctl.tui import Watch
@@ -29,10 +30,25 @@ class Fake:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
+    def watch(self, **kw: Any) -> Watch:
+        """The app, with jumping into a pane recorded instead of done."""
+        app = Watch(rpc=self.rpc, follow=self.follow, **kw)
+
+        async def jump(sock: str | None, pane: str) -> None:
+            self.calls.append(("jump", {"socket": sock, "pane": pane}))
+
+        app.jump = jump  # type: ignore[method-assign]
+        return app
+
     async def rpc(self, method: str, **params: Any) -> Any:
         self.calls.append((method, params))
         if method == "ls":
             return ROWS
+        if method == "feed":
+            return [{"id": "aaaa1111", "title": "refactor parser", "ts": NOW, "kind": "reply",
+                     "text": "Split the lexer."}]  # fmt: skip
+        if method == "pane":
+            return {"session_id": params["id"], "socket": "/tmp/agentctl-sock", "pane": "%1"}
         return {"session_id": params.get("id"), "chosen": "1. Yes"}
 
     async def follow(self, sid: str) -> AsyncIterator[dict[str, Any]]:
@@ -51,7 +67,7 @@ def test_narrow_layout_and_keys() -> None:
     fake = Fake()
 
     async def run() -> None:
-        app = Watch(rpc=fake.rpc, follow=fake.follow)
+        app = fake.watch()
         async with app.run_test(size=(45, 30)) as pilot:
             await pilot.pause()
             ol = app.query_one("#list", OptionList)
@@ -59,10 +75,12 @@ def test_narrow_layout_and_keys() -> None:
             assert first.disabled and "NEEDS APPROVAL" in str(first.prompt)  # pinned on top
             assert app.selected == "bbbb2222"  # highlight starts on the approval
             assert app.screen.has_class("narrow")
-            assert ol.display and not app.query_one("#detail").display
+            assert app.query_one("#left").display and not app.query_one("#detail").display
 
-            await pilot.press("enter")  # list -> detail
-            assert app.query_one("#detail").display and not ol.display
+            await pilot.press("enter")  # a live session: straight into its pane
+            assert ("jump", {"socket": "/tmp/agentctl-sock", "pane": "%1"}) in fake.calls
+            await pilot.press("space")  # list -> transcript
+            assert app.query_one("#detail").display and not app.query_one("#left").display
             await pilot.press("a")
             assert ("approve", {"id": "bbbb2222", "allow": True}) in fake.calls
             buttons = [str(b.label) for b in app.query("#actions Button").results(Button)]
@@ -70,14 +88,29 @@ def test_narrow_layout_and_keys() -> None:
             await pilot.click("#opt2")
             assert ("approve", {"id": "bbbb2222", "allow": True, "choice": 2}) in fake.calls
             await pilot.press("escape")  # detail -> list
-            assert ol.display
+            assert app.query_one("#left").display
 
             await pilot.press("j")  # moves past the WORKING header to aaaa1111
             assert app.selected == "aaaa1111"
-            await pilot.press("s")  # send belongs to the detail view on a phone
-            assert app.prompt_mode is None
-            await pilot.press("enter", "s", *"ship it", "enter")
+            await pilot.press("s", *"ship it", "enter")  # straight from the list
+            assert app.query_one("#left").display  # still on the list
             assert ("send", {"id": "aaaa1111", "text": "ship it"}) in fake.calls
+            await pilot.press("s")  # a multi-line paste arrives whole, then typing continues
+            app.post_message(events.Paste("line one\nline two\n"))
+            await pilot.pause()
+            await pilot.press(*"bug?", "enter")
+            assert ("send", {"id": "aaaa1111", "text": "line one\nline two\nbug?"}) in fake.calls
+            await pilot.press("s", "a", "shift+enter", "b", "ctrl+j", "c")
+            await pilot.press("backslash", "enter", "d")  # `\` + enter: new line on a phone
+            await pilot.press("ctrl+w", "e", "enter")  # ctrl+w deletes a word, as in a shell
+            assert ("send", {"id": "aaaa1111", "text": "a\nb\nc\ne"}) in fake.calls
+            await pilot.press("escape")
+
+            feed = app.query_one("#feed", OptionList)
+            assert "Split the lexer." in str(feed.get_option_at_index(0).prompt)
+            await pilot.click("#feed", offset=(5, 0))  # tap a feed line: read that session
+            await pilot.pause()
+            assert app.selected == "aaaa1111" and app.screen.has_class("detail-view")
             await pilot.press("escape")
 
             await pilot.press("slash", *"old")
@@ -95,11 +128,11 @@ def test_wide_layout_shows_both_panes() -> None:
     fake = Fake()
 
     async def run() -> None:
-        app = Watch(rpc=fake.rpc, follow=fake.follow)
+        app = fake.watch()
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             assert not app.screen.has_class("narrow")
-            assert app.query_one("#list").display and app.query_one("#detail").display
+            assert app.query_one("#left").display and app.query_one("#detail").display
 
     asyncio.run(run())
 
@@ -152,15 +185,15 @@ def test_transcript_folds_tools_and_is_selectable() -> None:
     fake = OneSession()
 
     async def run() -> None:
-        app = Watch(rpc=fake.rpc, follow=fake.follow)
+        app = fake.watch()
         async with app.run_test(size=(45, 40)) as pilot:
             await pilot.pause()
-            await pilot.press("j", "enter")
+            await pilot.press("j", "space")
             await pilot.pause()
             groups = list(app.query(Collapsible).results(Collapsible))
             assert len(groups) == 2 and all(g.collapsed for g in groups)
             title = str(groups[0].title)
-            assert "3 tools" in title and "bash ×2, read" in title and "1 failed" in title
+            assert "3 tools · last bash pytest -q" in title and "1 failed" in title
             assert "bash git status" in str(groups[1].title)  # a lone call shows its command
             assert len(app.query(Markdown)) == 1
             await pilot.click(groups[0].query_one("CollapsibleTitle"))
@@ -172,36 +205,26 @@ def test_transcript_folds_tools_and_is_selectable() -> None:
     asyncio.run(run())
 
 
-def test_screen_view_keys_close_and_new(tmp_path: Any) -> None:
+def test_close_and_new_with_folder_completion(tmp_path: Any) -> None:
     from textual.widgets import Input
+
+    for d in ("alpha", "alpine", "beta", ".alps"):
+        (tmp_path / d).mkdir()
 
     class Daemon(Fake):
         async def rpc(self, method: str, **params: Any) -> Any:
-            if method == "screen":
-                self.calls.append((method, params))
-                return {"screen": "\x1b[1mDo you trust this folder?\x1b[0m\n❯ 1. Yes\n  2. No"}
             if method == "launch":
                 self.calls.append((method, params))
-                return {"session_id": "new-abcd"}
+                return {"session_id": "new-abcd", "socket": "/s", "pane": "%9"}
             return await super().rpc(method, **params)
 
     fake = Daemon()
 
     async def run() -> None:
-        app = Watch(rpc=fake.rpc, follow=fake.follow, agents=["claude", "codex"])
+        app = fake.watch(agents=["claude", "codex"])
         async with app.run_test(size=(45, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("enter", "v")  # bbbb2222's terminal, as text
-            await pilot.pause()
-            assert app.screen.has_class("screen-view")
-            shown = str(app.query_one("#screen-text", Static).render())
-            assert "Do you trust this folder?" in shown and "\x1b" not in shown
-            await pilot.click("#key-Enter")
-            assert ("keys", {"id": "bbbb2222", "keys": ["Enter"]}) in fake.calls
-            await pilot.press("escape")  # screen -> transcript, still in the session
-            assert not app.screen.has_class("screen-view") and app.screen.has_class("detail-view")
-
-            await pilot.press("x")
+            await pilot.press("space", "x")
             await pilot.pause()
             await pilot.click("#yes")  # confirm dialog
             await pilot.pause()
@@ -209,12 +232,21 @@ def test_screen_view_keys_close_and_new(tmp_path: Any) -> None:
 
             await pilot.press("escape", "n")
             await pilot.pause()
-            app.screen.query_one("#folder", Input).value = str(tmp_path)
+            folder = app.screen.query_one("#folder", Input)
+            assert folder.has_focus  # type the folder straight away
+            await pilot.press("ctrl+u", *f"{tmp_path}/al")
+            await pilot.pause(0.3)
+            ol = app.screen.query_one("#recent", OptionList)
+            shown = [str(ol.get_option_at_index(i).prompt) for i in range(ol.option_count)]
+            assert shown == [f"{tmp_path}/alpha", f"{tmp_path}/alpine"]  # no dot-folders
+            await pilot.press("tab")  # takes the completion and goes into it
+            assert folder.value == f"{tmp_path}/alpha/"
             await pilot.click("#agent-codex")
             await pilot.click("#start")
             await pilot.pause()
             launch = next(p for m, p in fake.calls if m == "launch")
-            assert launch["agent"] == "codex" and launch["cwd"] == str(tmp_path)
+            assert launch["agent"] == "codex" and launch["cwd"] == f"{tmp_path}/alpha"
+            assert ("jump", {"socket": "/s", "pane": "%9"}) in fake.calls  # opened right away
 
     asyncio.run(run())
 
@@ -225,13 +257,13 @@ def test_copy_rename_and_help() -> None:
     fake = Fake()
 
     async def run() -> None:
-        app = Watch(rpc=fake.rpc, follow=fake.follow)
+        app = fake.watch()
         async with app.run_test(size=(45, 30)) as pilot:
             await pilot.pause()
             await pilot.press("question_mark")
             assert isinstance(app.screen, Help)
             await pilot.press("escape")
-            await pilot.press("enter", "c")
+            await pilot.press("space", "c")
             assert app.clipboard == ""  # the fake transcript has no reply yet
             app.query_one("#log").last_reply = "**done**"  # type: ignore[attr-defined]
             await pilot.press("c")
@@ -277,7 +309,7 @@ def test_projects_digest_queue_and_divider() -> None:
     fake = Daemon()
 
     async def run() -> None:
-        app = Watch(rpc=fake.rpc, follow=fake.follow)
+        app = fake.watch()
         async with app.run_test(size=(45, 30)) as pilot:
             await pilot.pause()
             assert "cx 5h 15%" in app.sub_title  # Codex usage in the title bar

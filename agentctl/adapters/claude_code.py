@@ -272,7 +272,9 @@ class ClaudeCodeAdapter:
         self.big_models: set[str] = set()  # models seen using more than 200k of context
         # From the status line wrapper (exact where the transcript only allows a guess):
         self.exact: dict[str, dict[str, Any]] = {}  # session -> {"window", "cache_expires"}
-        self.limits: dict[str, Any] | None = None  # newest plan limits any session reported
+        # newest plan limits any session reported; kept across restarts (status lines only
+        # redraw when a session is active)
+        self.limits: dict[str, Any] | None = store.get_json("claude_limits") if store else None
         self.state: dict[str, dict[str, Any]] = store.load() if store else {}  # pane + last hook
 
     async def discover(self) -> None:
@@ -309,7 +311,8 @@ class ClaudeCodeAdapter:
     def tick(self) -> None:
         self.scan_pids()  # a few tiny files; catches anything FSEvents missed (e.g. at startup)
         for s in list(self.reg.sessions.values()):
-            if s.source == self.source and s.status != "ended":
+            # "new-…": the daemon's placeholder for a launch Claude hasn't announced yet
+            if s.source == self.source and s.status != "ended" and not s.id.startswith("new-"):
                 self.sync(s.id)
 
     # --- transcripts ---
@@ -454,6 +457,8 @@ class ClaudeCodeAdapter:
         ]  # fmt: skip
         if windows:
             self.limits = {"plan": None, "at": datetime.now(UTC).isoformat(), "windows": windows}
+            if self.store:
+                self.store.set_json("claude_limits", self.limits)
 
     def usage(self) -> dict[str, Any] | None:
         """Plan limits; a window whose reset time has passed counts as 0% used."""

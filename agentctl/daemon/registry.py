@@ -86,6 +86,8 @@ class Store:
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS queued (session_id TEXT PRIMARY KEY, texts TEXT)"
         )
+        # small JSON values that must outlive a restart (e.g. the last Claude plan limits)
+        self.db.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
 
     def load(self) -> dict[str, dict[str, Any]]:
         rows = self.db.execute(f"SELECT session_id, {', '.join(self.COLS)} FROM sessions")
@@ -117,6 +119,14 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO queued VALUES (?, ?)", (sid, json.dumps(texts)))
         else:
             self.db.execute("DELETE FROM queued WHERE session_id = ?", (sid,))
+        self.db.commit()
+
+    def get_json(self, key: str) -> Any:
+        row = self.db.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def set_json(self, key: str, value: Any) -> None:
+        self.db.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)", (key, json.dumps(value)))
         self.db.commit()
 
     def put(self, sid: str, row: dict[str, Any]) -> None:

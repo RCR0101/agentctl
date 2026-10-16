@@ -146,3 +146,39 @@ def digest(
         }
         rows.append((order, row))
     return [row for _, row in sorted(rows, key=lambda x: x[0])]
+
+
+def feed(
+    sessions: list[Session], events: dict[str, list[SessionEvent]], limit: int = 30
+) -> list[dict[str, str]]:
+    """Newest first, across sessions (last 24h): replies and prompts, what each working session
+    is running right now, and approvals waiting. One line each, for the watch screen."""
+    cutoff = datetime.now(UTC) - timedelta(days=1)
+    rows: list[tuple[datetime, Session, str, str]] = []
+    for s in sessions:
+        evs = events.get(s.id, [])
+        msgs = [
+            e for e in evs if e.kind == "message" and e.payload.get("role") in ("assistant", "user")
+        ]
+        for e in msgs[-5:]:  # so one chatty session can't fill the feed
+            text = next(
+                (ln for ln in str(e.payload.get("text", "")).splitlines() if ln.strip()), ""
+            )
+            if e.payload["role"] == "user" and text.startswith("<"):
+                continue  # slash-command plumbing, not something anyone typed
+            rows.append((e.ts, s, "reply" if e.payload["role"] == "assistant" else "you", text))
+        if s.status == "working":
+            call = next((e for e in reversed(evs) if e.kind == "tool_call"), None)
+            if call and (not msgs or call.ts > msgs[-1].ts):
+                summary = (str(call.payload.get("summary", "")).splitlines() or [""])[0]
+                rows.append((call.ts, s, "now", f"{call.payload.get('name', '')} {summary}"))
+        if s.status == "awaiting_approval":
+            what = (s.pending_approval.tool if s.pending_approval else "") or ""
+            rows.append((s.last_activity, s, "approval", what))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    return [
+        {"id": s.id, "title": s.title or project_name(s.cwd), "ts": ts.isoformat(), "kind": kind,
+         "text": text.strip()[:200]}
+        for ts, s, kind, text in rows[:limit]
+        if ts > cutoff
+    ]  # fmt: skip

@@ -120,6 +120,41 @@ def test_queued_follow_up_waits_for_the_agent() -> None:
     assert s.status == "awaiting_input"
 
 
+def test_send_mid_turn_queues_by_default() -> None:
+    from agentctl.daemon.server import Server
+
+    sent: list[str] = []
+
+    class Agent:
+        source = "claude_code"
+
+        async def send(self, sid: str, text: str) -> None:
+            sent.append(text)
+
+        async def verified(self, sid: str) -> tuple[str, str]:
+            from agentctl.adapters.base import ControlError
+
+            raise ControlError("not in a pane")
+
+    reg = Registry(Bus())
+    reg.upsert(sess("aaaa1111", "/w"))  # working
+    srv = Server(reg, Agent(), Agent(), Agent())  # type: ignore[arg-type]
+
+    async def run() -> None:
+        r = await srv.dispatch("send", {"id": "aaaa1111", "text": "and add tests"})
+        assert r["queued"] == ["and add tests"] and sent == []
+        await srv.dispatch("send", {"id": "aaaa1111", "text": "steer now", "now": True})
+        assert sent == ["steer now"]
+        reg.set_status("aaaa1111", "awaiting_input")
+        r = await srv.dispatch("send", {"id": "aaaa1111", "text": "then commit"})
+        assert r["queued"] == ["and add tests", "then commit"]  # free, but keeps the order
+        srv.set_queued("aaaa1111", [])
+        r = await srv.dispatch("send", {"id": "aaaa1111", "text": "hi"})
+        assert "queued" not in r and sent == ["steer now", "hi"]
+
+    asyncio.run(run())
+
+
 def test_send_refused_while_a_menu_is_on_screen(monkeypatch: Any) -> None:
     from agentctl.daemon import server as srv_mod
     from agentctl.daemon.server import RpcError, Server
@@ -155,3 +190,22 @@ def test_send_refused_while_a_menu_is_on_screen(monkeypatch: Any) -> None:
         assert sent == []
 
     asyncio.run(run())
+
+
+def test_feed_newest_first_across_sessions() -> None:
+    a, b = sess("aaaa1111", "/w/api"), sess("bbbb2222", "/w/web", "awaiting_input")
+    a.title = "api"
+    evs = {
+        "aaaa1111": [
+            ev("aaaa1111", "message", ago=9, role="user", text="fix the tests"),
+            ev("aaaa1111", "message", ago=8, role="user", text="<command-name>/login"),
+            ev("aaaa1111", "tool_call", ago=1, name="Bash", summary="pytest -q\nmore"),
+        ],
+        "bbbb2222": [ev("bbbb2222", "message", ago=3, role="assistant", text="\nDone.\nDetails")],
+    }
+    rows = fleet.feed([a, b], evs)
+    assert [(r["title"], r["kind"], r["text"]) for r in rows] == [
+        ("api", "now", "Bash pytest -q"),  # what the working one is running right now
+        ("web", "reply", "Done."),
+        ("api", "you", "fix the tests"),  # slash-command plumbing left out
+    ]

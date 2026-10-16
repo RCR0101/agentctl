@@ -79,8 +79,9 @@ class Server:
         self.claude = claude
         self.codex = codex
         self.opencode = opencode
-        # Codex/opencode launched by `new` have no session id until their first message: until
-        # then they're listed as a placeholder ("new-a1b2") that send/keys/screen can target.
+        # Codex/opencode launched by `new` have no session id until their first message (Claude:
+        # until its folder is trusted): until then they're listed as a placeholder ("new-a1b2")
+        # that send/keys/screen can target.
         self.pending: dict[str, tuple[str, str]] = {}  # placeholder id -> (socket, pane)
         self.aliases: dict[str, str] = {}  # replaced placeholder id -> real session id
         self.adapters: dict[str, Adapter] = {
@@ -143,6 +144,9 @@ class Server:
                     self.opencode.register_pane(r["session_id"], r["socket"], r["pane"], pid)
             else:
                 self.claude.register_pane(r["session_id"], r["socket"], r["pane"])
+                if r["session_id"] not in self.reg.sessions:
+                    # e.g. at "trust this folder?": Claude announces the session only after it
+                    self.add_placeholder(p["agent"], p["cwd"], r["socket"], r["pane"])
             if not r["session_id"]:
                 r["session_id"] = self.add_placeholder(p["agent"], p["cwd"], r["socket"], r["pane"])
             return r
@@ -190,6 +194,10 @@ class Server:
             live = [x for x in self.reg.listing() if x.id not in self.pending]
             events = {sid: list(evs) for sid, evs in self.reg.events.items()}
             return fleet.digest(live, events, self.seen, self.seen["*"])
+        if method == "feed":
+            live = [x for x in self.reg.listing() if x.id not in self.pending]
+            events = {sid: list(evs) for sid, evs in self.reg.events.items()}
+            return fleet.feed(live, events)
         if method in ("queue", "unqueue"):
             s = self.reg.resolve(p["id"])
             items = self.queued.get(s.id, [])
@@ -224,6 +232,12 @@ class Server:
             return await asyncio.to_thread(
                 fleet.file_activity, p["path"], sessions, self.reg.events, hours
             )
+        if method == "send" and not p.get("now"):
+            # Mid-turn (or with follow-ups already waiting, to keep their order): queue it, so
+            # it neither steers the running turn nor lands in an approval menu.
+            s = self.reg.resolve(p["id"])
+            if s.status in ("working", "awaiting_approval") or self.queued.get(s.id):
+                return await self.dispatch("queue", {"id": s.id, "text": p["text"]})
         if method in ("send", "approve", "interrupt", "pane"):
             s = self.reg.resolve(p["id"])
             ad = self.adapters[s.source]
@@ -345,7 +359,7 @@ class Server:
                 continue
             text = self.queued[sid][0]
             try:
-                await self.dispatch("send", {"id": sid, "text": text})
+                await self.dispatch("send", {"id": sid, "text": text, "now": True})
             except (ControlError, RpcError, KeyError) as e:
                 self.queue_error[sid] = str(e).strip("'\"")
                 continue
@@ -360,10 +374,14 @@ class Server:
         self.reg.upsert(
             Session(
                 id=pid,
-                source="codex" if agent == "codex" else "opencode",
+                source="claude_code"
+                if agent == "claude"
+                else "codex"
+                if agent == "codex"
+                else "opencode",
                 origin="cli",
                 cwd=cwd,
-                title=f"new {agent} session · send it a first message",
+                title=f"new {agent} session",
                 status="awaiting_input",
                 controllable=True,
                 tmux_pane=pane,

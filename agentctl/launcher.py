@@ -28,7 +28,14 @@ def tmux_conf() -> str:
     watch = shlex.quote(f"{shlex.quote(sys.executable)} -m agentctl watch")
     return f"""\
 # agentctl's private tmux server. Written by agentctl; edits are overwritten.
-set -g status off
+# one dim line, so it's clear how to get back out of an agent
+set -g status on
+set -g status-style "fg=colour244,bg=default"
+set -g status-left ""
+set -g window-status-format ""
+set -g window-status-current-format ""
+set -g status-right "ctrl-] d back · ctrl-] w all sessions "
+set -g status-right-length 60
 set -g prefix C-]
 unbind C-b
 bind C-] send-prefix

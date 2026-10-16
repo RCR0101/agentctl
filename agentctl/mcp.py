@@ -204,6 +204,9 @@ def t_wait_for(call: Call, a: dict[str, Any]) -> str:
 
 def t_send_message(call: Call, a: dict[str, Any]) -> str:
     r = call("send", id=a["session"], text=a["text"])
+    if "queued" in r:
+        return (f"{short(r['session_id'])} is mid-turn, so it's queued ({len(r['queued'])} "
+                "waiting); agentctl sends it when the session is free.")  # fmt: skip
     return f"Sent to {short(r['session_id'])}. Use wait_for to get its answer."
 
 
@@ -228,7 +231,10 @@ def t_start_session(call: Call, a: dict[str, Any]) -> str:
     ready = wait_ready(call, sid, agent)
     msg = f"Started {agent} in {folder} as {short(sid)}."
     if ready != "ready":
-        return msg + f" It isn't ready: {ready}. The user has to answer that (agentctl watch, v)."
+        return (
+            msg
+            + f" It isn't ready: {ready}. The user has to answer that (open it in agentctl watch)."
+        )
     if a.get("first_message"):
         call("send", id=sid, text=a["first_message"])
         msg += " Sent the first message; use wait_for to get its answer."
@@ -332,8 +338,8 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "send_message",
-        "description": "Type a message into another session and submit it. Refused while that "
-        "session has a permission or trust prompt open.",
+        "description": "Type a message into another session and submit it. If that session "
+        "is mid-turn or awaiting approval, it's queued and sent once the session is free.",
         "inputSchema": {
             "type": "object",
             "required": ["session", "text"],
