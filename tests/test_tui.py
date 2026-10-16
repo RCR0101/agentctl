@@ -44,9 +44,6 @@ class Fake:
         self.calls.append((method, params))
         if method == "ls":
             return ROWS
-        if method == "feed":
-            return [{"id": "aaaa1111", "title": "refactor parser", "ts": NOW, "kind": "reply",
-                     "text": "Split the lexer."}]  # fmt: skip
         if method == "pane":
             return {"session_id": params["id"], "socket": "/tmp/agentctl-sock", "pane": "%1"}
         return {"session_id": params.get("id"), "chosen": "1. Yes"}
@@ -104,13 +101,6 @@ def test_narrow_layout_and_keys() -> None:
             await pilot.press("backslash", "enter", "d")  # `\` + enter: new line on a phone
             await pilot.press("ctrl+w", "e", "enter")  # ctrl+w deletes a word, as in a shell
             assert ("send", {"id": "aaaa1111", "text": "a\nb\nc\ne"}) in fake.calls
-            await pilot.press("escape")
-
-            feed = app.query_one("#feed", OptionList)
-            assert "Split the lexer." in str(feed.get_option_at_index(0).prompt)
-            await pilot.click("#feed", offset=(5, 0))  # tap a feed line: read that session
-            await pilot.pause()
-            assert app.selected == "aaaa1111" and app.screen.has_class("detail-view")
             await pilot.press("escape")
 
             await pilot.press("slash", *"old")
@@ -198,6 +188,11 @@ def test_transcript_folds_tools_and_is_selectable() -> None:
             assert len(app.query(Markdown)) == 1
             await pilot.click(groups[0].query_one("CollapsibleTitle"))
             assert not groups[0].collapsed  # tap expands
+            stops = set()
+            for _ in range(6):  # Tab moves between panes, never onto the `⚙` lines
+                await pilot.press("tab")
+                stops.add(type(app.focused).__name__)
+            assert stops <= {"OptionList", "Files", "Transcript"}, stops
             app.screen.selections = {w: SELECT_ALL for w in app.query("#log Static")}
             copied = app.screen.get_selected_text() or ""
             assert "fix the tests" in copied and "pytest -q" in copied
@@ -211,26 +206,54 @@ def test_close_and_new_with_folder_completion(tmp_path: Any) -> None:
     for d in ("alpha", "alpine", "beta", ".alps"):
         (tmp_path / d).mkdir()
 
+    outside = row("dddd4444", "awaiting_input") | {"tmux_pane": None, "controllable": False}
+    rows = [ROWS[1], row("eeee5555", "awaiting_input"), outside]
+
     class Daemon(Fake):
         async def rpc(self, method: str, **params: Any) -> Any:
+            if method == "ls":
+                return rows
             if method == "launch":
                 self.calls.append((method, params))
                 return {"session_id": "new-abcd", "socket": "/s", "pane": "%9"}
             return await super().rpc(method, **params)
 
+        async def follow(self, sid: str) -> AsyncIterator[dict[str, Any]]:
+            yield {"session": next(r for r in rows if r["id"] == sid), "events": []}
+            await asyncio.Event().wait()
+
     fake = Daemon()
 
     async def run() -> None:
+        from agentctl.tui import Confirm
+
         app = fake.watch(agents=["claude", "codex"])
         async with app.run_test(size=(45, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("space", "x")
-            await pilot.pause()
-            await pilot.click("#yes")  # confirm dialog
-            await pilot.pause()
-            assert ("close", {"id": "bbbb2222"}) in fake.calls
 
-            await pilot.press("escape", "n")
+            async def remove(sid: str) -> str:
+                app.select(sid)
+                app.rebuild()
+                await pilot.press("x")
+                await pilot.pause()
+                if not isinstance(app.screen, Confirm):
+                    return ""
+                q = app.screen.question
+                await pilot.click("#yes")
+                await pilot.pause()
+                return q
+
+            assert await remove("bbbb2222") == ""  # mid-approval: quitting would abort it
+            assert "Remove" in await remove("dddd4444")  # outside agentctl: just hidden
+            assert ("hide", {"id": "dddd4444"}) in fake.calls
+            assert ("close", {"id": "dddd4444"}) not in fake.calls
+            await pilot.press("z")  # undo
+            assert ("unhide", {"id": "dddd4444"}) in fake.calls and app.removed is None
+            assert "Quit" in await remove("eeee5555")  # in agentctl: quit, then hidden
+            calls = [c for c in fake.calls if c[1].get("id") == "eeee5555"]
+            assert calls[-2:] == [("close", {"id": "eeee5555"}), ("hide", {"id": "eeee5555"})]
+
+            await pilot.press("n")
             await pilot.pause()
             folder = app.screen.query_one("#folder", Input)
             assert folder.has_focus  # type the folder straight away
@@ -333,5 +356,34 @@ def test_projects_digest_queue_and_divider() -> None:
 
             await pilot.press("l", *"then commit", "enter")
             assert ("queue", {"id": "aaaa1111", "text": "then commit"}) in fake.calls
+
+    asyncio.run(run())
+
+
+def test_files_of_the_selected_session(tmp_path: Any) -> None:
+    from agentctl.tui import Files
+
+    for d in ("src", "node_modules", ".git", "__pycache__"):
+        (tmp_path / d).mkdir()
+    (tmp_path / "README.md").write_text("hi")
+    rows = [row("aaaa1111", "working") | {"cwd": str(tmp_path)}]
+
+    class Daemon(Fake):
+        async def rpc(self, method: str, **params: Any) -> Any:
+            return rows if method == "ls" else await super().rpc(method, **params)
+
+        async def follow(self, sid: str) -> AsyncIterator[dict[str, Any]]:
+            yield {"session": rows[0], "events": []}
+            await asyncio.Event().wait()
+
+    async def run() -> None:
+        app = Daemon().watch()
+        async with app.run_test(size=(45, 30)) as pilot:
+            await pilot.pause(0.5)
+            tree = app.query_one("#files", Files)
+            assert str(tree.path) == str(tmp_path) and tree.display
+            names = [str(n.label) for n in tree.root.children]
+            assert names == ["src", "README.md"]  # no dot-folders, caches or dependencies
+            assert str(tmp_path.name) in str(app.query_one("#files-title", Static).render())
 
     asyncio.run(run())

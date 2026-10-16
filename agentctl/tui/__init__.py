@@ -16,8 +16,9 @@ import os
 import shutil
 import subprocess
 from collections import Counter
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from rich.text import Text
@@ -31,6 +32,7 @@ from textual.suggester import Suggester
 from textual.widgets import (
     Button,
     Collapsible,
+    DirectoryTree,
     Footer,
     Header,
     Input,
@@ -40,9 +42,10 @@ from textual.widgets import (
     TextArea,
 )
 from textual.widgets.button import ButtonVariant
+from textual.widgets.collapsible import CollapsibleTitle
 from textual.widgets.option_list import Option
 
-from agentctl import SOCKET_PATH
+from agentctl import HOME, SOCKET_PATH
 from agentctl.cli import (
     SRC,
     STATUS_STYLE,
@@ -179,6 +182,23 @@ class Prompt(TextArea):
             await super()._on_key(event)
 
 
+class ToolGroup(Collapsible):
+    """A folded run of tool calls. Tap to open; kept out of Tab, so Tab moves between the
+    panes (list, files, transcript) and doesn't stop on every `⚙ Bash` line."""
+
+    def on_mount(self) -> None:
+        self.query_one(CollapsibleTitle).can_focus = False
+
+
+class Files(DirectoryTree):
+    """The project at a glance: no dot-files, caches or dependency folders."""
+
+    HIDE = {"node_modules", "__pycache__", "venv", "target", "dist", "build", "site-packages"}
+
+    def filter_paths(self, paths: Iterable[Path]) -> Iterable[Path]:
+        return [p for p in paths if not p.name.startswith(".") and p.name not in self.HIDE]
+
+
 class Transcript(VerticalScroll):
     """A session's events as widgets. Consecutive tool calls and results fold into one
     Collapsible ("⚙ 6 tools · bash ×5, read"); click or Enter on it to expand."""
@@ -222,7 +242,7 @@ class Transcript(VerticalScroll):
         if kind in TOOL_KINDS and (self.group or kind != "status_change"):
             if self.group is None:
                 self.body = Vertical()
-                self.group = Collapsible(self.body, collapsed=True)
+                self.group = ToolGroup(self.body, collapsed=True)
                 self.tools.clear()
                 self.failed = 0
                 self.mount(self.group)
@@ -285,7 +305,9 @@ HELP = """\
   c             copy the last reply
   r             rename (agentctl's own name for it)
   o             adopt: move it into agentctl
-  x             close it (stays resumable)
+  x             remove from the list (quits it first if it runs in
+                agentctl; nothing is deleted, it can be resumed)
+  z             bring back the session x just removed
   m             replies as raw text / Markdown
   esc           back
 
@@ -507,10 +529,11 @@ class Watch(App[None]):
     CSS = """
     #main { height: 1fr; }
     #left { width: 45%; min-width: 36; }
-    #list, #feed { border: none; padding: 0; text-wrap: nowrap; text-overflow: ellipsis; }
+    #list { border: none; padding: 0; text-wrap: nowrap; text-overflow: ellipsis; }
     #list { height: auto; max-height: 65%; }
-    #feed-title { color: $text-muted; text-style: bold; padding: 0 1; border-top: solid $panel; }
-    #feed { height: 1fr; }
+    #files-title { color: $text-muted; text-style: bold; padding: 0 1; border-top: solid $panel;
+                   text-wrap: nowrap; text-overflow: ellipsis; }
+    #files { height: 1fr; padding: 0; }
     #detail { width: 1fr; }
     #header { height: auto; }
     #log { height: 1fr; }
@@ -537,7 +560,8 @@ class Watch(App[None]):
         Binding("o", "adopt", "adopt"),
         Binding("n", "new", "new"),
         Binding("/", "filter", "find"),
-        Binding("x", "close", "close", show=False),
+        Binding("x", "close", "remove"),
+        Binding("z", "undo_remove", "undo", show=False),
         Binding("e", "toggle_ended", "ended", show=False),
         Binding("b", "toggle_notify", "bell", show=False),
         Binding("c", "copy", "copy", show=False),
@@ -560,6 +584,7 @@ class Watch(App[None]):
     ) -> None:
         super().__init__()
         self.agents = agents  # installed agents, found on first `n`
+        self.removed: str | None = None  # last session `x` removed, for `z`
         self.by_project = False  # `p`: group the list by project instead of status
         self.usage = ""
         self.conflicts: set[tuple[str, str]] | None = None
@@ -581,8 +606,8 @@ class Watch(App[None]):
         with Horizontal(id="main"):
             with Vertical(id="left"):
                 yield OptionList(id="list")
-                yield Static("RECENT", id="feed-title")
-                yield OptionList(id="feed")
+                yield Static(id="files-title")
+                yield Files(HOME, id="files")
             with Vertical(id="detail"):
                 yield Static(id="header")
                 yield Transcript(id="log")
@@ -633,8 +658,9 @@ class Watch(App[None]):
             return live and bool(r and r["status"] == "working")
         if action == "adopt":
             return detail and bool(r and not r["controllable"])
-        if action == "close":
-            return detail and bool(r and r["tmux_pane"] and r["status"] != "working")
+        if action == "close":  # quitting an agent mid-turn would abort the turn
+            busy = ("working", "awaiting_approval")
+            return r is not None and not (r["tmux_pane"] and r["status"] in busy)
         if action == "new":
             return not detail or not self.narrow
         if action == "later":
@@ -645,8 +671,10 @@ class Watch(App[None]):
             return detail and r is not None
         if action == "help":
             return not detail or not self.narrow
-        if action == "quit":
-            return not (self.narrow and detail)  # esc first; keeps the phone footer to one row
+        if action == "quit":  # a phone footer has room for one row: q is in `?` there
+            return not self.narrow
+        if action == "undo_remove":
+            return self.removed is not None
         return True
 
     def restream(self) -> None:
@@ -674,8 +702,6 @@ class Watch(App[None]):
         self.announce(rows)
         self.rows = rows
         self.rebuild()
-        with contextlib.suppress(Exception):
-            self.show_feed(await self.rpc("feed"))
         r = self.current()
         if r and r.get("unread") and (not self.narrow or self.screen.has_class("detail-view")):
             with contextlib.suppress(Exception):
@@ -757,30 +783,22 @@ class Watch(App[None]):
         self.update_actions(row)
         self.refresh_bindings()
 
-    def show_feed(self, items: list[dict[str, Any]]) -> None:
-        """What's happening across sessions, newest first; tap a line to read that session."""
-        icon = {"reply": ("◆", "green"), "you": ("›", "cyan"), "now": ("⚙", "yellow"),
-                "approval": ("⚠ needs approval", "bold yellow")}  # fmt: skip
-        opts = []
-        for i, it in enumerate(items):
-            t = Text(no_wrap=True, overflow="ellipsis")
-            t.append(fmt_ts(it["ts"], True) + " ", style="dim")
-            t.append(it["title"][:18] + " ", style="bold")
-            mark, style = icon[it["kind"]]
-            t.append(mark + " ", style=style).append(it["text"], style="dim")
-            opts.append(Option(t, id=f"{i}|{it['id']}"))  # one session can have several lines
-        ol = self.query_one("#feed", OptionList)
-        if [str(o.prompt) for o in opts] != [
-            str(ol.get_option_at_index(i).prompt) for i in range(ol.option_count)
-        ]:
-            ol.set_options(opts)
+    @work(exclusive=True, group="files")
+    async def show_files(self, r: dict[str, Any] | None) -> None:
+        """The selected session's project (git root, else its folder) under the list."""
+        from agentctl.daemon.fleet import project_root
 
-    @on(OptionList.OptionSelected, "#feed")
-    def feed_selected(self, event: OptionList.OptionSelected) -> None:
-        sid = (event.option.id or "").split("|", 1)[1]
-        self.select(sid)
-        self.rebuild()
-        self.action_log()
+        root = await asyncio.to_thread(project_root, r["cwd"]) if r and r["cwd"] else ""
+        title = self.query_one("#files-title", Static)
+        tree = self.query_one("#files", Files)
+        if not root or not os.path.isdir(root):
+            title.update(Text(f"FILES · {tilde(root)} is gone" if root else "FILES"))
+            tree.display = False
+            return
+        title.update(Text(f"FILES · {tilde(root)}"))
+        tree.display = True
+        if str(tree.path) != root:
+            tree.path = root
 
     def project_options(self, rows: list[dict[str, Any]]) -> list[Option]:
         """The list grouped by project (git repo, else folder): projects with sessions that
@@ -843,6 +861,7 @@ class Watch(App[None]):
             self.selected = sid
             self.selected_pane = (self.current() or {}).get("tmux_pane")
             self.stream(sid)
+            self.show_files(self.current())
             self.update_actions(self.current())
             self.refresh_bindings()
 
@@ -869,14 +888,14 @@ class Watch(App[None]):
 
     def action_down(self) -> None:
         w = self.focused
-        if isinstance(w, OptionList):
+        if isinstance(w, (OptionList, DirectoryTree)):
             w.action_cursor_down()
         elif isinstance(w, Transcript):
             w.scroll_down()
 
     def action_up(self) -> None:
         w = self.focused
-        if isinstance(w, OptionList):
+        if isinstance(w, (OptionList, DirectoryTree)):
             w.action_cursor_up()
         elif isinstance(w, Transcript):
             w.scroll_up()
@@ -1106,10 +1125,36 @@ class Watch(App[None]):
         r = self.current()
         if not r:
             return
-        name = r["title"] or short_cwd(r["cwd"])
-        q = f"Quit {name}? It stays resumable: o (adopt) reopens it."
-        if await self.push_screen_wait(Confirm(q, "Quit it")):
-            await self.control("close")
+        name, sid = r["title"] or short_cwd(r["cwd"]), r["id"]
+        if r["tmux_pane"]:
+            q = f"Quit {name} and remove it from the list? It stays resumable: o reopens it."
+        else:
+            q = f"Remove {name} from the list? Nothing is deleted; it's back if it gets active."
+        if not await self.push_screen_wait(
+            Confirm(q, "Quit and remove" if r["tmux_pane"] else "Remove")
+        ):
+            return
+        try:
+            if r["tmux_pane"]:
+                await self.rpc("close", id=sid)
+            await self.rpc("hide", id=sid)
+            self.removed = sid
+            self.notify(f"✓ removed {short_id(sid)} · z brings it back", timeout=6)
+        except Exception as e:
+            self.notify(str(e), severity="error", timeout=8)
+        await self.poll()
+
+    async def action_undo_remove(self) -> None:
+        sid, self.removed = self.removed, None
+        if sid:
+            try:
+                await self.rpc("unhide", id=sid)
+                self.notify(f"✓ {short_id(sid)} is back", timeout=3)
+            except Exception as e:
+                self.notify(str(e), severity="error", timeout=8)
+            await self.poll()
+            self.select(sid)
+            self.rebuild()
 
     def action_toggle_markdown(self) -> None:
         self.markdown = not self.markdown

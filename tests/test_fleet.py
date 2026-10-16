@@ -192,20 +192,22 @@ def test_send_refused_while_a_menu_is_on_screen(monkeypatch: Any) -> None:
     asyncio.run(run())
 
 
-def test_feed_newest_first_across_sessions() -> None:
-    a, b = sess("aaaa1111", "/w/api"), sess("bbbb2222", "/w/web", "awaiting_input")
-    a.title = "api"
-    evs = {
-        "aaaa1111": [
-            ev("aaaa1111", "message", ago=9, role="user", text="fix the tests"),
-            ev("aaaa1111", "message", ago=8, role="user", text="<command-name>/login"),
-            ev("aaaa1111", "tool_call", ago=1, name="Bash", summary="pytest -q\nmore"),
-        ],
-        "bbbb2222": [ev("bbbb2222", "message", ago=3, role="assistant", text="\nDone.\nDetails")],
-    }
-    rows = fleet.feed([a, b], evs)
-    assert [(r["title"], r["kind"], r["text"]) for r in rows] == [
-        ("api", "now", "Bash pytest -q"),  # what the working one is running right now
-        ("web", "reply", "Done."),
-        ("api", "you", "fix the tests"),  # slash-command plumbing left out
-    ]
+def test_hidden_until_it_has_newer_activity() -> None:
+    from agentctl.daemon.server import Server
+
+    reg = Registry(Bus())
+    s = reg.upsert(sess("aaaa1111", "/w", "awaiting_input"))
+    s.last_activity = NOW - timedelta(minutes=5)
+    srv = Server(reg, None, None, None)  # type: ignore[arg-type]
+
+    async def ids(**p: Any) -> list[str]:
+        return [r["id"] for r in await srv.dispatch("ls", p)]
+
+    async def run() -> None:
+        await srv.dispatch("hide", {"id": "aaaa1111"})
+        assert await ids() == [] and await ids(all=True) == ["aaaa1111"]
+        later = ev("aaaa1111", "message", role="user", text="resumed")
+        reg.add_event(later.model_copy(update={"ts": datetime.now(UTC)}))  # active again
+        assert await ids() == ["aaaa1111"]
+
+    asyncio.run(run())

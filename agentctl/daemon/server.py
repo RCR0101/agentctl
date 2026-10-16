@@ -73,6 +73,8 @@ class Server:
                 store.set_seen("*", seen["*"])
         self.seen = {k: datetime.fromtimestamp(v, UTC) for k, v in seen.items()}
         self.queued: dict[str, list[str]] = store.queued() if store else {}
+        # removed from the list by the user (time removed); back once it has newer activity
+        self.hidden: dict[str, float] = (store.get_json("hidden") if store else None) or {}
         self.armed: dict[str, bool] = {}  # may the next follow-up go out yet?
         self.queue_error: dict[str, str] = {}
         self.reg = registry
@@ -184,6 +186,15 @@ class Server:
             sock, pane = await ad.verified(s.id)
             await close_pane(sock, pane, ad.holder(s.id))
             return {"session_id": s.id}
+        if method in ("hide", "unhide"):
+            s = self.reg.resolve(p["id"])
+            if method == "hide":
+                self.hidden[s.id] = time.time()
+            else:
+                self.hidden.pop(s.id, None)
+            if self.store:
+                self.store.set_json("hidden", self.hidden)
+            return {"session_id": s.id}
         if method == "seen":
             s = self.reg.resolve(p["id"])
             self.seen[s.id] = datetime.now(UTC)
@@ -194,10 +205,6 @@ class Server:
             live = [x for x in self.reg.listing() if x.id not in self.pending]
             events = {sid: list(evs) for sid, evs in self.reg.events.items()}
             return fleet.digest(live, events, self.seen, self.seen["*"])
-        if method == "feed":
-            live = [x for x in self.reg.listing() if x.id not in self.pending]
-            events = {sid: list(evs) for sid, evs in self.reg.events.items()}
-            return fleet.feed(live, events)
         if method in ("queue", "unqueue"):
             s = self.reg.resolve(p["id"])
             items = self.queued.get(s.id, [])
@@ -275,6 +282,8 @@ class Server:
                     continue
                 # Hide long-dead sessions unless asked: there are hundreds of old transcripts.
                 if not p.get("all") and s.status == "ended" and s.last_activity < cutoff:
+                    continue
+                if not p.get("all") and self.hidden.get(s.id, 0) >= s.last_activity.timestamp():
                     continue
                 out.append(s)
             await asyncio.to_thread(lambda: [fleet.project_root(s.cwd) for s in out])
