@@ -42,8 +42,9 @@ def project_name(cwd: str) -> str:
     return Path(root).name or root or "?"
 
 
-def edited_files(evs: Iterable[SessionEvent], cwd: str, since: datetime) -> set[str]:
-    out: set[str] = set()
+def edited_files(evs: Iterable[SessionEvent], cwd: str, since: datetime) -> dict[str, datetime]:
+    """Absolute path -> when this session last edited it (since `since`)."""
+    out: dict[str, datetime] = {}
     for e in evs:
         if e.kind != "tool_call" or e.ts < since:
             continue
@@ -52,8 +53,30 @@ def edited_files(evs: Iterable[SessionEvent], cwd: str, since: datetime) -> set[
         for p in str(e.payload.get("summary") or "").split(", "):
             p = p.strip()
             if p and "\n" not in p:
-                out.add(os.path.normpath(os.path.join(cwd, p)))
+                path = os.path.normpath(os.path.join(cwd, os.path.expanduser(p)))
+                out[path] = max(out.get(path, e.ts), e.ts)
     return out
+
+
+def file_activity(
+    path: str, sessions: list[Session], events: Mapping[str, Iterable[SessionEvent]], hours: float
+) -> dict[str, object]:
+    """Who else is on this file: sessions that edited it in the last `hours`, and live
+    sessions working in the same repo right now."""
+    path = os.path.normpath(os.path.expanduser(path))
+    since = datetime.now(UTC) - timedelta(hours=hours)
+    edits = []
+    for s in sessions:
+        when = edited_files(events.get(s.id, ()), s.cwd, since).get(path)
+        if when:
+            edits.append({"id": s.id, "title": s.title, "status": s.status, "at": when.isoformat()})
+    root = project_root(os.path.dirname(path))
+    busy = [
+        {"id": s.id, "title": s.title, "status": s.status}
+        for s in sessions
+        if s.status in BUSY and s.cwd and project_root(s.cwd) == root
+    ]
+    return {"path": path, "edited_by": edits, "working_in_repo": busy}
 
 
 def unread(evs: Iterable[SessionEvent], seen: datetime) -> int:

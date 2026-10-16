@@ -871,6 +871,21 @@ def close(
 
 
 @app.command()
+def mcp(
+    allow_write: Annotated[
+        bool,
+        typer.Option("--allow-write", help="Also let the agent send, queue and start sessions."),
+    ] = False,
+) -> None:
+    """MCP server (stdio) so an agent can see and coordinate your other agents. Read-only
+    unless --allow-write. Never exposes approve/deny/close: those stay yours. Add it with
+    e.g. `claude mcp add -s user agentctl -- agentctl mcp`."""
+    from agentctl.mcp import serve
+
+    serve(allow_write)
+
+
+@app.command()
 def watch(
     notify: Annotated[bool, typer.Option(help="macOS notification + bell on approval.")] = False,
 ) -> None:

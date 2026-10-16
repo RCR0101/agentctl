@@ -90,6 +90,11 @@ def test_queued_follow_up_waits_for_the_agent() -> None:
         async def send(self, sid: str, text: str) -> None:
             sent.append(text)
 
+        async def verified(self, sid: str) -> tuple[str, str]:
+            from agentctl.adapters.base import ControlError
+
+            raise ControlError("not in a pane")  # so no screen to check
+
     reg = Registry(Bus())
     s = reg.upsert(sess("aaaa1111", "/w"))
     srv = Server(reg, Agent(), Agent(), Agent())  # type: ignore[arg-type]
@@ -113,3 +118,40 @@ def test_queued_follow_up_waits_for_the_agent() -> None:
 
     asyncio.run(run())
     assert s.status == "awaiting_input"
+
+
+def test_send_refused_while_a_menu_is_on_screen(monkeypatch: Any) -> None:
+    from agentctl.daemon import server as srv_mod
+    from agentctl.daemon.server import RpcError, Server
+
+    sent: list[str] = []
+
+    class Agent:
+        source = "claude_code"
+
+        async def verified(self, sid: str) -> tuple[str, str]:
+            return "/tmp/sock", "%1"
+
+        async def send(self, sid: str, text: str) -> None:
+            sent.append(text)
+
+    reg = Registry(Bus())
+    reg.upsert(sess("aaaa1111", "/w", "awaiting_input"))  # status hasn't caught up yet
+    srv = Server(reg, Agent(), Agent(), Agent())  # type: ignore[arg-type]
+    shown = "⏺ Bash(rm -rf build)\n Do you want to proceed?\n ❯ 1. Yes\n   2. No"
+
+    async def screen(sock: str, pane: str) -> str:
+        return shown
+
+    monkeypatch.setattr(srv_mod, "screen", screen)
+
+    async def run() -> None:
+        try:
+            await srv.dispatch("send", {"id": "aaaa1111", "text": "1"})
+        except RpcError as e:
+            assert "menu open" in str(e)
+        else:
+            raise AssertionError("a send into an open permission menu must be refused")
+        assert sent == []
+
+    asyncio.run(run())

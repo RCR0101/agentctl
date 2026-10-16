@@ -41,6 +41,15 @@ class RpcError(Exception):
     pass
 
 
+# Text on screen meaning a menu is waiting for an answer (permission, trust, confirm). Typed
+# text there could be taken as the answer ("1" + Enter = Yes), so sends are refused.
+MENU_MARKERS = (
+    "Do you want to proceed?",  # Claude Code permission prompt
+    "Do you trust",  # Claude Code folder trust
+    "Press enter to confirm",  # Codex
+    "Permission required",  # opencode
+)
+
 # Keys the screen view may press in a session's terminal (tmux key names).
 KEYS = {"Up", "Down", "Left", "Right", "Enter", "Escape", "Tab", "BTab", "Space", "y", "n"}
 KEYS |= {str(d) for d in range(10)}
@@ -209,10 +218,17 @@ class Server:
             elif s.source == "codex":
                 await self.codex.scan_locks()
             return {"session_id": s.id, "pid": self.adapters[s.source].holder(s.id)}
+        if method == "file_activity":
+            sessions = [x for x in self.reg.sessions.values() if x.id not in self.pending]
+            hours = float(p.get("hours") or 2)
+            return await asyncio.to_thread(
+                fleet.file_activity, p["path"], sessions, self.reg.events, hours
+            )
         if method in ("send", "approve", "interrupt", "pane"):
             s = self.reg.resolve(p["id"])
             ad = self.adapters[s.source]
             if method == "send":
+                await self.refuse_if_menu(ad, s.id)
                 await ad.send(s.id, p["text"])
                 return {"session_id": s.id}
             if method == "approve":
@@ -260,6 +276,19 @@ class Server:
                 "events": [e.model_dump(mode="json") for e in evs],
             }
         raise RpcError(f"unknown method {method!r}")
+
+    async def refuse_if_menu(self, ad: Adapter, sid: str) -> None:
+        """The status can lag the screen by a second; the screen can't. Look before typing."""
+        try:
+            sock, pane = await ad.verified(sid)
+        except ControlError:
+            return  # not in a pane (Codex via app-server): the adapter does its own checks
+        bottom = "\n".join((await screen(sock, pane)).splitlines()[-20:])
+        if any(m in bottom for m in MENU_MARKERS):
+            raise RpcError(
+                f"{short_id(sid)} has a menu open (permission or trust prompt); a message "
+                "could answer it. Answer it first (agentctl approve/deny, or watch)."
+            )
 
     def dump(self, s: Session, conflicts: dict[str, list[str]] | None = None) -> dict[str, Any]:
         d = s.model_dump(mode="json")

@@ -152,6 +152,37 @@ A new Codex or opencode session has no id of its own until its first message, so
 gives it a temporary one (`new-a1b2`), and `send`, `attach` and the dashboard work with it.
 After the first message it shows up under its real id, and the temporary id keeps working.
 
+## Agents coordinating agents (MCP)
+
+`agentctl mcp` is an MCP server, so one agent can see and coordinate your others, including
+across vendors. For example, a Claude session can hand work to Codex.
+
+```sh
+claude mcp add -s user agentctl -- agentctl mcp                  # read-only
+claude mcp add -s user agentctl -- agentctl mcp --allow-write    # also send, queue, start
+codex mcp add agentctl -- agentctl mcp
+```
+
+| tool | what it gives the agent |
+|---|---|
+| `list_sessions` | every session, most urgent first, flagged when it needs approval, may be stuck, overlaps another, or has follow-ups queued |
+| `read_transcript` | a session's recent messages and tool calls, labelled as untrusted |
+| `whats_new` | replies you haven't read, and the files touched |
+| `check_file` | before editing: who else edited this file recently, and who's working in its repo |
+| `usage` | Claude Code and Codex plan limits |
+| `wait_for` | blocks until a session finishes its turn, then returns its reply. It waits locally, so the agent spends no tokens polling |
+| `send_message` · `queue_followup` · `start_session` | with `--allow-write` only |
+
+Example: "Start a Codex session in ~/api with the migration task, wait for it, then tell the
+frontend session the new endpoint."
+
+**What it never does:**
+- **Answer another agent's prompts.** Approve, deny, close and adopt aren't available to
+  agents. A send is refused while the target has a permission or trust menu on screen, so
+  typed text can't answer it.
+- **Pass arbitrary flags.** `start_session` takes a model name, never flags.
+- **Treat transcripts as instructions.** Other agents' transcripts are returned as data.
+
 ## Uninstall
 
 ```sh
