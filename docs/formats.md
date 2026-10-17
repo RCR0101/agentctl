@@ -102,8 +102,17 @@ Keys:
   immediately, with no Enter. Deny = the digit of the option starting with "No" (Escape also
   cancels). Long options wrap onto indented continuation lines.
 - Interrupt: Escape. Claude then **puts the interrupted prompt back in the input box**, so
-  `send` first clears the input (`C-u BSpace` ×10; `C-u` alone clears one line).
-- Multiline: `load-buffer -` + `paste-buffer -p` arrives as one message; Enter after 150 ms.
+  `send` first clears the input: `C-u BSpace` ×10, four times, 50 ms apart. `C-u` clears one
+  wrapped row; one long burst of these keys is taken for a paste and only partly applied (a
+  ~790-char prompt kept 74 chars).
+- Every message goes as `load-buffer -` + `paste-buffer -p`, then Enter after 150 ms.
+  Measured on 2.1.302: typed `send-keys -l` text of 800 chars arrived intact; 1,500 and 3,500
+  arrived as only their last ~450 chars; a typed tab is a keypress and vanishes. A bracketed
+  paste arrived intact at every size tried (up to 3,500 chars, 40 lines).
+- Claude wraps a large paste (~1,000+ chars or 10+ lines; 790 chars or 3 lines were not
+  wrapped) in the user text as `\n\n<pasted_content id="2ef5">\n…\n</pasted_content
+  id="2ef5">\n`; agentctl unwraps it when reading.
+- Ctrl-J inserts a newline without submitting (an alternative to pasting for short text).
 - `--session-id <uuid>` is honoured, and `--resume <id>` keeps the same id.
 - Launching from inside a Claude Code session leaks `CLAUDE_CODE_*` env vars into tmux; the
   child then starts in "API Usage Billing" mode. The launcher strips them with `env -u`.

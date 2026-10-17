@@ -76,14 +76,14 @@ def test_fake_app_server_send_and_approve(tmp_path: Path) -> None:
             True,
         )
         await a.send(tid, "please touch x")
-        for _ in range(50):
+        for _ in range(250):  # up to 5s: a busy machine can be slow to start the fake server
             if s.status == "awaiting_approval":
                 break
             await asyncio.sleep(0.02)
         assert s.pending_approval and s.pending_approval.tool == "shell: touch x"
         assert s.pending_approval.options["3"] == "No"
         assert await a.approve(tid, None, allow=True) == "1. Yes"
-        for _ in range(50):
+        for _ in range(250):
             if s.status == "awaiting_input":
                 break
             await asyncio.sleep(0.02)

@@ -49,6 +49,21 @@ STATUS_STYLE = {
     "ended": "dim",
 }
 SRC = {"claude_code": "cc", "codex": "cx", "opencode": "oc"}
+AGENT = {"claude_code": "Claude Code", "codex": "Codex", "opencode": "opencode"}
+ORIGIN = {"desktop": ("app", "desktop app"), "sdk": ("sdk", "SDK")}
+
+
+def agent_label(r: dict[str, Any]) -> str:
+    """Short agent label: "cc", or "cc app" for the desktop app, "cc sdk" for SDK runs."""
+    tag = ORIGIN.get(r.get("origin") or "")
+    return f"{SRC[r['source']]} {tag[0]}" if tag else SRC[r["source"]]
+
+
+def agent_name(r: dict[str, Any]) -> str:
+    tag = ORIGIN.get(r.get("origin") or "")
+    return f"{AGENT[r['source']]} {tag[1]}" if tag else AGENT[r["source"]]
+
+
 SOURCES = {"claude": "claude_code", "codex": "codex", "opencode": "opencode"}
 STATUS_SHORT = {
     "awaiting_approval": "APPROVE",
@@ -187,16 +202,18 @@ def ctx_text(s: dict[str, Any], short: bool = False) -> Text:
     return Text(f"{tokens(used)} / {approx}{tokens(window)} ({pct}%)", style=style)
 
 
-def cache_text(s: dict[str, Any]) -> Text:
-    """Time left before the prompt cache expires (Claude only; Codex doesn't expose it)."""
+def cache_text(s: dict[str, Any], short: bool = False) -> Text:
+    """Time left before the prompt cache expires (Claude only; Codex doesn't expose it).
+    short: whole minutes, blank once expired, for the dense watch list."""
     exp = s.get("cache_expires_at")
     if not exp:
         return Text("")
     left = int((datetime.fromisoformat(exp) - datetime.now(UTC)).total_seconds())
     if left <= 0:
-        return Text("expired", style="dim")
+        return Text("" if short else "expired", style="dim")
     m, sec = divmod(left, 60)
-    return Text(f"{m}m" if m >= 5 else f"{m}m{sec:02d}s", style="yellow" if m < 5 else "green")
+    text = f"{m}m" if m >= 5 or short else f"{m}m{sec:02d}s"
+    return Text(text, style="yellow" if m < 5 else "green")
 
 
 def status_text(status: str) -> Text:
@@ -217,7 +234,7 @@ def approval_panel(
         hint = f"agentctl approve {short} [--choice N]\nagentctl deny {short}"
     return Panel(
         Group(body, Text(hint, style="dim")),
-        title=Text(f" ⚠ {short} needs approval ", style="bold yellow"),
+        title=Text(f" {short} needs approval ", style="bold yellow"),
         title_align="left",
         border_style="yellow",
         expand=False,
@@ -226,10 +243,10 @@ def approval_panel(
 
 def session_notes(s: dict[str, Any]) -> list[Text]:
     """Lines about the session beyond its status: overlapping agents, queued follow-ups."""
-    notes = [Text(f"⚠ {c}", style="yellow") for c in s.get("conflicts") or []]
+    notes = [Text(f"! {c}", style="yellow") for c in s.get("conflicts") or []]
     if s.get("queued"):
         n = len(s["queued"])
-        t = Text(f"⏳ {n} follow-up{'s' if n > 1 else ''} queued for when it's free", style="cyan")
+        t = Text(f"{n} follow-up{'s' if n > 1 else ''} queued for when it's free", style="cyan")
         if s.get("queue_error"):
             t.append(f" (can't send: {s['queue_error']})", style="red")
         notes.append(t)
@@ -237,13 +254,11 @@ def session_notes(s: dict[str, Any]) -> list[Text]:
 
 
 def compact_header(s: dict[str, Any]) -> Group:
-    """Phone-width header: title, then status · source · control · context on one line."""
+    """Phone-width header: title, then status · agent · context · folder on one line."""
     title = Text(s["title"] or short_cwd(s["cwd"]), style="bold", no_wrap=True, overflow="ellipsis")
     meta = Text(no_wrap=True, overflow="ellipsis")
     meta.append_text(status_text(s["status"]))
-    meta.append(f" {SRC[s['source']]} {short_id(s['id'])} ", style="dim")
-    if s["tmux_pane"] or s["controllable"]:
-        meta.append("● ", style="green")
+    meta.append(f" {agent_label(s)} {short_id(s['id'])} ", style="dim")
     if s.get("context_tokens") is not None:
         meta.append_text(ctx_text(s, short=True)).append(" ")
     meta.append(short_cwd(s["cwd"]), style="blue")
@@ -255,7 +270,7 @@ def session_header(s: dict[str, Any], compact: bool = False) -> Panel | Group:
         return compact_header(s)
     meta = Text()
     meta.append_text(status_text(s["status"])).append("  ")
-    meta.append(f"{s['source']} · {s['origin']} · ", style="dim")
+    meta.append(f"{agent_name(s)} · ", style="dim")
     if s["tmux_pane"]:
         meta.append("in agentctl", style="dim")
     elif s["controllable"]:
@@ -308,7 +323,7 @@ def render(
     elif kind == "tool_call":
         first, *rest = p["summary"].splitlines() or [""]
         more = " …" if rest else ""
-        line.append(f"⚙ {p['name']} ", style="yellow").append(first[:160] + more, style="dim")
+        line.append(f"▸ {p['name']} ", style="yellow").append(first[:160] + more, style="dim")
     elif kind == "tool_result":
         lines = p["text"].splitlines() or [""]
         style = "red" if p.get("is_error") else "dim"
@@ -317,7 +332,7 @@ def render(
     elif kind == "status_change":
         line.append("● ", style=STATUS_STYLE[p["to"]]).append_text(status_text(p["to"]))
     elif kind == "approval_request":
-        line.append(f"⚠ approval asked: {p.get('tool') or '?'}", style="yellow")
+        line.append(f"approval asked: {p.get('tool') or '?'}", style="yellow")
     elif kind == "error":
         line.append(f"✗ {p.get('text', '')}", style="red")
     else:
@@ -360,7 +375,7 @@ def ls(
     for r in rows:
         cells: list[str | Text] = [short_id(r["id"])]
         if not narrow:
-            cells.append(SRC[r["source"]])
+            cells.append(agent_label(r))
         cells += [status_text(r["status"]), age(r["last_activity"])]
         if not narrow:
             cells += [ctx_text(r, short=True), cache_text(r), short_cwd(r["cwd"])]
@@ -368,7 +383,7 @@ def ls(
         if r.get("unread"):
             title.append(f"{r['unread']} new ", style="bold cyan")
         if r.get("conflicts"):
-            title.append("⚠ ", style="yellow")
+            title.append("! ", style="yellow")
         title.append(
             r["title"] or short_cwd(r["cwd"]), style="dim" if r["status"] == "ended" else ""
         )
@@ -386,7 +401,7 @@ def ls(
     out.print(summary)
     for r in rows:
         for c in r.get("conflicts") or []:
-            out.print(Text(f"⚠ {short_id(r['id'])} {c}", style="yellow"))
+            out.print(Text(f"! {short_id(r['id'])} {c}", style="yellow"))
     for r in rows:
         if r["status"] == "awaiting_approval" and r["pending_approval"]:
             out.print(approval_panel(r["id"], r["pending_approval"], r["controllable"]))

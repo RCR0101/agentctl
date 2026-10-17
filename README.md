@@ -114,9 +114,9 @@ Across sessions, the dashboard and `ls` show:
 
 - **Unread:** cards say "3 new" for replies you haven't read. Opening a session (or
   `agentctl tail`) marks it read, and its transcript has a "── new since 09:52 ──" line.
-- **Overlaps:** ⚠ marks two live agents working in the same git repo at once, or that edited
+- **Overlaps:** `!` marks two live agents working in the same git repo at once, or that edited
   the same file in the last two hours. A toast appears when a new overlap starts.
-- **Queued follow-ups:** ⏳ marks messages waiting to be sent. Each goes out once the agent is
+- **Queued follow-ups:** "N queued" marks messages waiting to be sent. Each goes out once the agent is
   waiting for input, one per finished turn.
 - **Plan usage** (5-hour and weekly windows) for Claude Code and Codex in the title bar, and
   in `agentctl usage`. Claude Code reports these only to its status line, so the hooks install

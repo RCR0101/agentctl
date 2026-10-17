@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -111,6 +112,38 @@ def tool_summary(inp: Any) -> str:
     return cap(json.dumps(inp), 300)
 
 
+_TAG = re.compile(r"<([a-z-]+)>(.*?)</\1>", re.S)
+_PASTE = re.compile(r'<pasted_content id="(\w+)">\n(.*?)\n?</pasted_content id="\1">\n?', re.S)
+_OUTPUT = ("local-command-stdout", "local-command-stderr", "bash-stdout", "bash-stderr")
+
+
+def unwrap_pastes(text: str) -> str:
+    """Claude Code wraps a large paste (agentctl sends every message as one) in
+    <pasted_content id="…"> tags; show what was pasted."""
+    return _PASTE.sub(r"\2", text).strip() if "<pasted_content" in text else text
+
+
+def local_command(text: str) -> tuple[str, str] | None:
+    """Claude Code records slash commands and `!` shell commands as tagged user text. Returns
+    (kind, text) to show instead: ("message", "/login") for the command, ("tool_result", …) for
+    its output ("tool_error" if stderr has text), ("skip", "") for the caveat boilerplate.
+    None if `text` isn't one of those."""
+    if not text.lstrip().startswith("<"):
+        return None
+    tags = dict(_TAG.findall(text))
+    if "local-command-caveat" in tags:
+        return "skip", ""
+    if "command-name" in tags:
+        return "message", f"{tags['command-name']} {tags.get('command-args', '')}".strip()
+    if "bash-input" in tags:
+        return "message", "! " + tags["bash-input"].strip()
+    if any(k in tags for k in _OUTPUT):
+        out = "\n".join(tags[k].strip() for k in _OUTPUT if tags.get(k, "").strip())
+        err = any(tags.get(k, "").strip() for k in _OUTPUT if k.endswith("stderr"))
+        return ("tool_error" if err else "tool_result", out) if out else ("skip", "")
+    return None
+
+
 def result_text(c: Any) -> str:
     if isinstance(c, str):
         return c
@@ -181,14 +214,23 @@ def parse_entry(d: dict[str, Any], t: Transcript) -> list[SessionEvent]:
         return out
     msg = d.get("message") or {}
     content = msg.get("content")
+
+    def user_text(text: str) -> None:
+        kind, shown = local_command(text) or ("message", text)
+        if kind == "message":
+            ev("message", role="user", text=cap(shown))
+        elif kind in ("tool_result", "tool_error"):
+            ev("tool_result", tool_use_id=None, text=cap(shown), is_error=kind == "tool_error")
+
     if typ == "user":
         if d.get("isMeta") or d.get("isCompactSummary"):
             return out
         if isinstance(content, str):
+            content = unwrap_pastes(content)
             mark("prompt")
             if t.first_prompt is None and not agent and not content.startswith("<"):
                 t.first_prompt = content
-            ev("message", role="user", text=cap(content))
+            user_text(content)
             return out
         for b in content if isinstance(content, list) else []:
             bt = b.get("type")
@@ -201,9 +243,9 @@ def parse_entry(d: dict[str, Any], t: Transcript) -> list[SessionEvent]:
                     is_error=bool(b.get("is_error")),
                 )
             elif bt == "text":
-                text = b.get("text", "")
+                text = unwrap_pastes(b.get("text", ""))
                 mark("interrupted" if text.startswith("[Request interrupted") else "prompt")
-                ev("message", role="user", text=cap(text))
+                user_text(text)
             elif bt == "image":
                 ev("message", role="user", text="[image]")
         return out

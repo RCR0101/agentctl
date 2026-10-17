@@ -10,7 +10,11 @@ from agentctl.adapters.base import ControlError
 
 _buf_ids = itertools.count()
 OPTION_RE = re.compile(r"^\s*(?:[❯›]\s*)?(\d+)\.\s+(.+?)\s*$")  # Claude ❯, Codex ›
-CLEAR_KEYS = ["C-u", "BSpace"] * 10  # C-u clears one line; BSpace joins the previous one
+# C-u clears one wrapped row, BSpace joins the previous one. A long burst of them is taken
+# for a paste and partly dropped, so they go in short rounds.
+# ponytail: 4 rounds clear 40 rows; a longer leftover prompt survives
+CLEAR_KEYS = ["C-u", "BSpace"] * 10
+_pane_locks: dict[tuple[str | None, str], asyncio.Lock] = {}
 
 
 def tmux_bin() -> str:
@@ -38,19 +42,21 @@ async def run(sock: str | None, *args: str, stdin: bytes | None = None) -> str:
 
 
 async def send_text(
-    sock: str | None, pane: str, text: str, clear: bool = True, settle: float = 0.0
+    sock: str | None, pane: str, text: str, clear: bool = True, settle: float = 0.15
 ) -> None:
-    if clear:  # Escape-interrupts put the old prompt back in the input box
-        await run(sock, "send-keys", "-t", pane, *CLEAR_KEYS)
-    if "\n" in text:
+    """Always a bracketed paste: typed keys over ~800 chars are taken for an unbracketed
+    paste and Claude keeps only the tail, and a typed tab is a keypress. One send per pane
+    at a time, or two messages interleave in the input box and go as one."""
+    async with _pane_locks.setdefault((sock, pane), asyncio.Lock()):
+        if clear:  # Escape-interrupts put the old prompt back in the input box
+            for _ in range(4):
+                await run(sock, "send-keys", "-t", pane, *CLEAR_KEYS)
+                await asyncio.sleep(0.05)
         buf = f"agentctl-{os.getpid()}-{next(_buf_ids)}"
         await run(sock, "load-buffer", "-b", buf, "-", stdin=text.encode())
         await run(sock, "paste-buffer", "-p", "-d", "-b", buf, "-t", pane)
-        settle = max(settle, 0.15)  # let the app finish the bracketed paste before Enter
-    else:
-        await run(sock, "send-keys", "-t", pane, "-l", "--", text)
-    await asyncio.sleep(settle)
-    await run(sock, "send-keys", "-t", pane, "Enter")
+        await asyncio.sleep(settle)  # let the app finish the paste before Enter
+        await run(sock, "send-keys", "-t", pane, "Enter")
 
 
 async def keys(sock: str | None, pane: str, *k: str) -> None:

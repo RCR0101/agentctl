@@ -159,3 +159,33 @@ def test_window_learned_from_any_session_of_the_model(
     a.open_transcript(proj / "big.jsonl", startup=False)
     assert reg.sessions["small"].context_window == 1_000_000  # claude-x proved it has 1M
     assert reg.sessions["small"].cache_expires_at is not None  # 5m tier seen
+
+
+def test_slash_and_bang_commands_read_cleanly() -> None:
+    from agentctl.adapters.claude_code import local_command
+
+    cmd = "<command-name>/model</command-name>\n<command-message>model</command-message>\n" \
+          "<command-args>haiku</command-args>"  # fmt: skip
+    assert local_command(cmd) == ("message", "/model haiku")
+    out = "<local-command-stdout>Login interrupted</local-command-stdout>"
+    assert local_command(out) == ("tool_result", "Login interrupted")
+    assert local_command("<local-command-caveat>The command below…</local-command-caveat>") == (
+        "skip",
+        "",
+    )
+    assert local_command("<bash-input> ls -la</bash-input>") == ("message", "! ls -la")
+    ok = "<bash-stdout>a.txt</bash-stdout><bash-stderr></bash-stderr>"
+    assert local_command(ok) == ("tool_result", "a.txt")  # empty stderr isn't an error
+    bad = "<bash-stdout></bash-stdout><bash-stderr>no such file</bash-stderr>"
+    assert local_command(bad) == ("tool_error", "no such file")
+    assert local_command("<b>not ours</b>") is None and local_command("plain text") is None
+
+
+def test_pasted_content_unwrapped() -> None:
+    from agentctl.adapters.claude_code import unwrap_pastes
+
+    raw = '\n\n<pasted_content id="2ef5">\nfirst\nsecond\n</pasted_content id="2ef5">\n'
+    assert unwrap_pastes(raw) == "first\nsecond"
+    typed = 'see this <pasted_content id="a1b2">\nlog line\n</pasted_content id="a1b2">\n'
+    assert unwrap_pastes(typed) == "see this log line"
+    assert unwrap_pastes("plain") == "plain"

@@ -211,3 +211,19 @@ def test_hidden_until_it_has_newer_activity() -> None:
         assert await ids() == ["aaaa1111"]
 
     asyncio.run(run())
+
+
+def test_cancel_one_queued_message() -> None:
+    from agentctl.daemon.server import Server
+
+    reg = Registry(Bus())
+    reg.upsert(sess("aaaa1111", "/w"))
+    srv = Server(reg, None, None, None)  # type: ignore[arg-type]
+    srv.set_queued("aaaa1111", ["a", "b", "c"])
+
+    async def run() -> None:
+        r = await srv.dispatch("unqueue", {"id": "aaaa1111", "index": 1})
+        assert r["queued"] == ["a", "c"]
+        assert (await srv.dispatch("unqueue", {"id": "aaaa1111"}))["queued"] == []
+
+    asyncio.run(run())

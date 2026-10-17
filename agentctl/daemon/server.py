@@ -114,6 +114,9 @@ class Server:
                     raise  # the client hung up (e.g. Ctrl-C on `tail -f`): not an error
                 except (RpcError, ControlError, launcher.LaunchError, KeyError, ValueError) as e:
                     reply = {"id": req.get("id"), "error": {"message": str(e).strip("'\"")}}
+                    if req.get("method") in ("send", "queue", "approve"):  # trace, never the text
+                        sid = str((req.get("params") or {}).get("id", ""))[:8]
+                        log.info("%s %s refused: %s", req["method"], sid, reply["error"]["message"])
                 except Exception as e:  # anything else: answer, don't drop the connection
                     log.exception("%s failed", req.get("method"))
                     reply = {"id": req.get("id"), "error": {"message": f"{type(e).__name__}: {e}"}}
@@ -208,7 +211,12 @@ class Server:
         if method in ("queue", "unqueue"):
             s = self.reg.resolve(p["id"])
             items = self.queued.get(s.id, [])
-            items = [*items, p["text"]] if method == "queue" else []
+            if method == "queue":
+                items = [*items, p["text"]]
+            elif p.get("index") is not None:  # cancel one
+                items = [x for i, x in enumerate(items) if i != int(p["index"])]
+            else:
+                items = []
             self.set_queued(s.id, items)
             return {"session_id": s.id, "queued": items}
         if method == "statusline":
@@ -244,6 +252,7 @@ class Server:
             # it neither steers the running turn nor lands in an approval menu.
             s = self.reg.resolve(p["id"])
             if s.status in ("working", "awaiting_approval") or self.queued.get(s.id):
+                log.info("send %s: %d chars, %s: queued", short_id(s.id), len(p["text"]), s.status)
                 return await self.dispatch("queue", {"id": s.id, "text": p["text"]})
         if method in ("send", "approve", "interrupt", "pane"):
             s = self.reg.resolve(p["id"])
@@ -251,6 +260,9 @@ class Server:
             if method == "send":
                 await self.refuse_if_menu(ad, s.id)
                 await ad.send(s.id, p["text"])
+                log.info(
+                    "send %s: %d chars, %s: typed in", short_id(s.id), len(p["text"]), s.status
+                )
                 return {"session_id": s.id}
             if method == "approve":
                 chosen = await ad.approve(s.id, p.get("choice"), bool(p.get("allow", True)))

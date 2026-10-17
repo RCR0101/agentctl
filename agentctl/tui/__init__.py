@@ -17,7 +17,7 @@ import shutil
 import subprocess
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -47,9 +47,10 @@ from textual.widgets.option_list import Option
 
 from agentctl import HOME, SOCKET_PATH
 from agentctl.cli import (
-    SRC,
     STATUS_STYLE,
     age,
+    agent_label,
+    cache_text,
     ctx_text,
     render,
     session_header,
@@ -109,9 +110,9 @@ def badges(r: dict[str, Any]) -> Text:
     if r.get("unread"):
         t.append(f"{r['unread']} new ", style="bold cyan")
     if r.get("conflicts"):
-        t.append("⚠ ", style="bold yellow")
+        t.append("! ", style="bold yellow")
     if r.get("queued"):
-        t.append(f"⏳{len(r['queued'])} ", style="cyan")
+        t.append(f"{len(r['queued'])} queued ", style="cyan")
     return t
 
 
@@ -122,9 +123,11 @@ def card_text(r: dict[str, Any], folder: bool = True) -> Text:
     t.append_text(badges(r))
     title_style = "bold yellow" if approval else "dim" if r["status"] == "ended" else "bold"
     t.append(r["title"] or short_cwd(r["cwd"]), style=title_style)
-    t.append(f"\n{short_id(r['id'])} {SRC[r['source']]} {age(r['last_activity'])} ", style="dim")
+    t.append(f"\n{short_id(r['id'])} {agent_label(r)} {age(r['last_activity'])} ", style="dim")
     if r.get("context_tokens") is not None:
         t.append_text(ctx_text(r, short=True)).append(" ")
+    if cache_text(r, short=True):
+        t.append("cache ", style="dim").append_text(cache_text(r, short=True)).append(" ")
     if folder:
         t.append(short_cwd(r["cwd"]), style="blue")
     else:
@@ -132,12 +135,19 @@ def card_text(r: dict[str, Any], folder: bool = True) -> Text:
     return t
 
 
-def row_text(r: dict[str, Any]) -> Text:
+def row_text(r: dict[str, Any], status: bool = False) -> Text:
+    """Wide row: ls's columns minus the folder (FILES shows it); status only when the
+    list isn't already grouped by it."""
     approval = r["status"] == "awaiting_approval"
     t = Text(no_wrap=True, overflow="ellipsis")
     t.append(short_id(r["id"]), style="bold yellow" if approval else "bold")
-    t.append(f" {SRC[r['source']]} ", style="dim")
+    t.append(f" {agent_label(r):<6} ", style="dim")
+    if status:
+        st = status_text(r["status"])
+        t.append_text(st).append(" " * (8 - len(st)))
     t.append(f"{age(r['last_activity']):>3} ", style="dim")
+    for cell, width in ((ctx_text(r, short=True), 4), (cache_text(r, short=True), 3)):
+        t.append(" " * (width - len(cell))).append_text(cell).append(" ")
     t.append_text(badges(r))
     title_style = "yellow" if approval else "dim" if r["status"] == "ended" else ""
     t.append(r["title"] or short_cwd(r["cwd"]), style=title_style)
@@ -150,8 +160,13 @@ TOOL_KINDS = ("tool_call", "tool_result", "status_change")
 class Prompt(TextArea):
     """Message box. Enter submits; a paste keeps its newlines (Textual's Input keeps only the
     first line of a paste, which silently cut multi-line messages). New line: shift/alt+enter,
-    ctrl+j, or `\\` then enter (phones have no shift+enter). TextArea brings the rest: ctrl+a/e/
+    ctrl+j, or `\\` then enter (phones have no shift+enter). ↑ on the first line / ↓ on the
+    last recall what you sent this session, like a shell. TextArea brings the rest: ctrl+a/e/
     w/u/k, undo, selection."""
+
+    sends: list[str] = []  # what was sent to this session, set when the box opens
+    recall = 0  # how far back ↑ has gone; 0 is the draft
+    draft = ""
 
     BINDINGS = [
         Binding("shift+enter,alt+enter,ctrl+j", "newline", show=False),
@@ -169,7 +184,26 @@ class Prompt(TextArea):
     def action_newline(self) -> None:
         self.insert("\n")
 
+    def recall_step(self, step: int) -> None:
+        pos = min(max(self.recall + step, 0), len(self.sends))
+        if pos == self.recall:
+            return
+        if self.recall == 0:
+            self.draft = self.text
+        self.recall = pos
+        self.load_text(self.sends[-pos] if pos else self.draft)
+        self.move_cursor(self.document.end)
+
     async def _on_key(self, event: events.Key) -> None:
+        row = self.cursor_location[0]
+        if event.key in ("up", "down") and self.sends:
+            if (event.key == "up" and row == 0) or (
+                event.key == "down" and row == self.document.line_count - 1 and self.recall
+            ):
+                event.prevent_default()
+                event.stop()
+                self.recall_step(1 if event.key == "up" else -1)
+                return
         if event.key == "enter":
             event.prevent_default()
             event.stop()
@@ -184,7 +218,7 @@ class Prompt(TextArea):
 
 class ToolGroup(Collapsible):
     """A folded run of tool calls. Tap to open; kept out of Tab, so Tab moves between the
-    panes (list, files, transcript) and doesn't stop on every `⚙ Bash` line."""
+    panes (list, files, transcript) and doesn't stop on every `▸ Bash` line."""
 
     def on_mount(self) -> None:
         self.query_one(CollapsibleTitle).can_focus = False
@@ -192,6 +226,8 @@ class ToolGroup(Collapsible):
 
 class Files(DirectoryTree):
     """The project at a glance: no dot-files, caches or dependency folders."""
+
+    ICON_NODE, ICON_NODE_EXPANDED, ICON_FILE = "▸ ", "▾ ", "  "  # not Textual's emoji
 
     HIDE = {"node_modules", "__pycache__", "venv", "target", "dist", "build", "site-packages"}
 
@@ -201,7 +237,7 @@ class Files(DirectoryTree):
 
 class Transcript(VerticalScroll):
     """A session's events as widgets. Consecutive tool calls and results fold into one
-    Collapsible ("⚙ 6 tools · bash ×5, read"); click or Enter on it to expand."""
+    Collapsible ("▸ 12:01 6 tools · last bash pytest"); click or Enter on it to expand."""
 
     DEFAULT_CSS = """
     Transcript { padding: 0 1; }
@@ -222,16 +258,26 @@ class Transcript(VerticalScroll):
         self.last_reply = ""  # for `c`
         self.seen_at: str | None = None
         self.any = False
+        self.calls: dict[str, tuple[str, str]] = {}  # tool calls without a result: id -> label, ts
+        self.last_ts = ""
 
     async def reset(self, narrow: bool, markdown: bool, seen_at: str | None = None) -> None:
         await self.remove_children()
         self.narrow, self.markdown, self.group = narrow, markdown, None
         self.last_reply = ""
         self.seen_at, self.any = seen_at, False
+        self.calls, self.last_ts = {}, ""
         self.anchor()  # stay at the newest entry until the user scrolls up
 
     def add(self, ev: dict[str, Any]) -> None:
         kind, p = ev["kind"], ev["payload"]
+        self.last_ts = ev["ts"]
+        if kind == "tool_call":
+            self.calls[p.get("id") or ""] = (f"{p['name']} {first_line(p['summary'])}", ev["ts"])
+        elif kind == "tool_result":
+            self.calls.pop(p.get("tool_use_id") or "", None)
+        elif kind == "message":
+            self.calls.clear()
         if self.seen_at and ev["ts"] > self.seen_at and kind != "status_change":
             if self.any:  # mark where "new since you last looked" starts
                 when = fmt_ts(self.seen_at, True)
@@ -242,7 +288,9 @@ class Transcript(VerticalScroll):
         if kind in TOOL_KINDS and (self.group or kind != "status_change"):
             if self.group is None:
                 self.body = Vertical()
-                self.group = ToolGroup(self.body, collapsed=True)
+                self.group = ToolGroup(
+                    self.body, collapsed=True, collapsed_symbol="▸", expanded_symbol="▾"
+                )
                 self.tools.clear()
                 self.failed = 0
                 self.mount(self.group)
@@ -273,13 +321,20 @@ class Transcript(VerticalScroll):
         t = Text(f"{self.group_ts} ", style="dim")
         name, _, rest = self.latest.partition(" ")
         if n > 1:
-            t.append(f"⚙ {n} tools · last ", style="yellow")
-        else:
-            t.append("⚙ ", style="yellow")
+            t.append(f"{n} tools · last ", style="yellow")
         t.append(f"{name} ", style="yellow").append(rest[:120], style="dim")
         if self.failed:
             t.append(f" · {self.failed} failed", style="red")
         return t
+
+
+def first_line(s: str) -> str:
+    return (s.splitlines() or [""])[0]
+
+
+def since(iso: str) -> str:
+    secs = int((datetime.now(UTC) - datetime.fromisoformat(iso)).total_seconds())
+    return f"{secs // 60}m {secs % 60:02d}s" if secs >= 60 else f"{max(secs, 0)}s"
 
 
 def fmt_ts(iso: str, narrow: bool) -> str:
@@ -301,6 +356,8 @@ HELP = """\
 [b]session[/b]
   s             send a message
   l             queue a message for when it's free
+  h             what you sent it from here, and whether each arrived
+                (in the send box: ↑ / ↓ recall them)
   i             interrupt the running turn
   c             copy the last reply
   r             rename (agentctl's own name for it)
@@ -309,6 +366,7 @@ HELP = """\
                 agentctl; nothing is deleted, it can be resumed)
   z             bring back the session x just removed
   m             replies as raw text / Markdown
+  ctrl-r        reload everything (it also reconnects by itself)
   esc           back
 
   b             bell on new approvals
@@ -330,6 +388,49 @@ class Help(ModalScreen[None]):
 
     def on_click(self) -> None:
         self.dismiss()
+
+
+class History(ModalScreen[str | None]):
+    """What this dashboard sent to one session, newest first, and whether each one shows up in
+    its transcript. Pick one to put it back in the send box."""
+
+    DEFAULT_CSS = """
+    History { align: center middle; }
+    History > Vertical { width: 95%; max-width: 100; height: auto; max-height: 90%;
+                         border: round $accent; padding: 0 1; background: $surface; }
+    History OptionList, History OptionList:focus { height: auto; max-height: 30; border: none; }
+    """
+    BINDINGS = [Binding("escape,h", "dismiss(None)", "close")]
+
+    def __init__(self, title: str, sends: list[dict[str, Any]], arrived: set[str]) -> None:
+        super().__init__()
+        self.head, self.sends, self.arrived = title, sends, arrived
+
+    def compose(self) -> ComposeResult:
+        opts = []
+        for i, s in enumerate(reversed(self.sends)):
+            t = Text(no_wrap=True, overflow="ellipsis")
+            t.append(s["at"] + " ", style="dim")
+            if s["outcome"] == "failed":
+                t.append("failed ", style="bold red")
+            elif s["text"].strip() in self.arrived:
+                t.append("arrived ", style="green")
+            else:
+                t.append(f"{s['outcome']}, not in transcript yet ", style="yellow")
+            t.append(first_line(s["text"]))
+            if s.get("error"):
+                t.append(f"\n  {s['error']}", style="red")
+            opts.append(Option(t, id=str(len(self.sends) - 1 - i)))
+        with Vertical():
+            yield Static(Text(f"Sent to {self.head} from here", style="bold"))
+            if opts:
+                yield OptionList(*opts)
+            else:
+                yield Static(Text("nothing sent from this dashboard yet", style="dim"))
+
+    @on(OptionList.OptionSelected)
+    def chosen(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(self.sends[int(event.option.id or 0)]["text"])
 
 
 class Digest(ModalScreen[str | None]):
@@ -539,6 +640,11 @@ class Watch(App[None]):
     #log { height: 1fr; }
     #prompt { display: none; height: auto; max-height: 8; }
     #prompt.show { display: block; }
+    #running { height: 1; color: $warning; display: none; text-wrap: nowrap;
+               text-overflow: ellipsis; }
+    #queued { height: auto; display: none; }
+    #queued Button { width: 1fr; height: 1; min-width: 0; border: none; content-align: left middle;
+                     text-wrap: nowrap; text-overflow: ellipsis; }
     #actions { height: auto; display: none; }
     #actions.show { display: block; }
     #actions Button { width: 1fr; height: 1; min-width: 0; border: none; margin: 0 0 0 0; }
@@ -571,6 +677,8 @@ class Watch(App[None]):
         Binding("r", "rename", "rename", show=False),
         Binding("question_mark", "help", "keys"),
         Binding("m", "toggle_markdown", "markdown", show=False),
+        Binding("ctrl+r", "refresh", "refresh", show=False),
+        Binding("h", "history", "history", show=False),
         Binding("q", "quit", "quit"),
         *[Binding(str(n), f"choose({n})", show=False) for n in range(1, 5)],
     ]
@@ -595,11 +703,18 @@ class Watch(App[None]):
         self.selected: str | None = None
         self.filter = ""
         self.prompt_mode: str | None = None
+        self.prompt_target: str | None = None  # the session the box was opened for
+        # what this dashboard sent, per session, until it quits: {at, text, outcome, error}
+        self.sent: dict[str, list[dict[str, str]]] = {}
         self.approvals: set[str] | None = None  # None until the first poll
         self.shape: list[tuple[Any, ...]] = []
         self.show_ended = False
         self.markdown = True  # render replies as Markdown; `m` shows the raw text
         self.choices: dict[str, str] | None = None  # options the approval buttons show
+        self.last_outcome, self.last_error = "", ""  # of the last control() call
+        self.queued_shown: list[str] | None = None
+        self.header_shown: tuple[str, bool, str] | None = None
+        self.keys_shown: list[bool | None] = []
 
     def compose(self) -> ComposeResult:
         yield Header(icon="◆")
@@ -611,6 +726,8 @@ class Watch(App[None]):
             with Vertical(id="detail"):
                 yield Static(id="header")
                 yield Transcript(id="log")
+                yield Static(id="running")
+                yield Vertical(id="queued")
                 yield Vertical(id="actions")
         yield Prompt(id="prompt", soft_wrap=True, show_line_numbers=False)
         yield Footer(compact=True, show_command_palette=False)
@@ -621,6 +738,7 @@ class Watch(App[None]):
         self.set_interval(1.0, self.poll)
         await self.poll_usage()
         self.set_interval(30.0, self.poll_usage)
+        self.set_interval(1.0, self.tick_running)
         self.query_one("#list", OptionList).focus()
 
     @property
@@ -652,8 +770,8 @@ class Watch(App[None]):
             return bool(self.prompt_mode) or (self.narrow and detail)
         if action in ("filter", "toggle_ended"):
             return not detail or not self.narrow
-        if action == "send":  # outside agentctl too: action_send says how to get it in
-            return bool(r and r["status"] != "ended")
+        if action == "send":
+            return r is not None
         if action == "interrupt":
             return live and bool(r and r["status"] == "working")
         if action == "adopt":
@@ -728,7 +846,7 @@ class Watch(App[None]):
         found = {(r["id"], c) for r in rows for c in r.get("conflicts") or []}
         if self.conflicts is not None:
             for sid, c in found - self.conflicts:
-                self.notify(f"⚠ {short_id(sid)} {c}", severity="warning", timeout=10)
+                self.notify(f"{short_id(sid)} {c}", severity="warning", timeout=10)
         self.conflicts = found
 
     def filtered(self) -> list[dict[str, Any]]:
@@ -745,6 +863,7 @@ class Watch(App[None]):
             (
                 r["id"], r["status"], r["title"], r["controllable"], age(r["last_activity"]),
                 r.get("unread"), len(r.get("conflicts") or []), len(r.get("queued") or []),
+                ctx_text(r, short=True).plain, cache_text(r, short=True).plain,
             )
             for r in rows
         ] + [(self.show_ended, self.by_project)]  # fmt: skip
@@ -764,24 +883,37 @@ class Watch(App[None]):
                 if not folded:
                     fmt = card_text if self.narrow else row_text
                     opts += [Option(fmt(r), id=r["id"]) for r in group]
-            ol.set_options(opts)
             ids = [o.id for o in opts]
-            if self.selected not in ids and self.selected_pane:  # placeholder became real
-                same = next((r for r in rows if r["tmux_pane"] == self.selected_pane), None)
-                if same:
-                    self.selected = None
-                    self.select(same["id"])
-            if self.selected and self.selected in ids:
-                ol.highlighted = ids.index(self.selected)
-            elif any(ids):  # setting .highlighted posts no event, so select explicitly
-                i = next(i for i, x in enumerate(ids) if x)
-                ol.highlighted = i
-                self.select(ids[i])
+            if ids == [o.id for o in ol.options]:  # same rows in place: new text, no relayout
+                for i, o in enumerate(opts):
+                    if o.prompt != ol.get_option_at_index(i).prompt:
+                        ol.replace_option_prompt_at_index(i, o.prompt)
+            else:
+                ol.set_options(opts)
+                if self.selected not in ids and self.selected_pane:  # placeholder became real
+                    same = next((r for r in rows if r["tmux_pane"] == self.selected_pane), None)
+                    if same:
+                        self.selected = None
+                        self.select(same["id"])
+                if self.selected and self.selected in ids:
+                    ol.highlighted = ids.index(self.selected)
+                elif any(ids):  # setting .highlighted posts no event, so select explicitly
+                    i = next(i for i, x in enumerate(ids) if x)
+                    ol.highlighted = i
+                    self.select(ids[i])
         row = next((r for r in rows if r["id"] == self.selected), None)
-        if row:
+        # Each update relayouts the whole screen, transcript included: only on a change
+        header = (str(row), self.narrow, cache_text(row).plain) if row else None
+        if row and header != self.header_shown:
+            self.header_shown = header
             self.query_one("#header", Static).update(session_header(row, compact=self.narrow))
         self.update_actions(row)
-        self.refresh_bindings()
+        self.update_queued(row)
+        self.tick_running()
+        keys = [self.check_action(b.action, ()) for b in self.BINDINGS if isinstance(b, Binding)]
+        if keys != self.keys_shown:
+            self.keys_shown = keys
+            self.refresh_bindings()
 
     @work(exclusive=True, group="files")
     async def show_files(self, r: dict[str, Any] | None) -> None:
@@ -816,8 +948,13 @@ class Watch(App[None]):
                 if n:
                     head.append(f"{n} ").append_text(status_text(status)).append(" ")
             opts.append(Option(head, disabled=True))
-            fmt = (lambda r: card_text(r, folder=False)) if self.narrow else row_text
-            opts += [Option(fmt(r), id=r["id"]) for r in group]
+            opts += [
+                Option(
+                    card_text(r, folder=False) if self.narrow else row_text(r, status=True),
+                    id=r["id"],
+                )
+                for r in group
+            ]
         if not self.show_ended and not self.filter:
             opts.append(
                 Option(Text(" ended sessions hidden · e shows", style="dim"), disabled=True)
@@ -844,6 +981,42 @@ class Watch(App[None]):
             variant: ButtonVariant = "error" if no else "success" if k == "1" else "default"
             box.mount(Button(f"{k}. {label}" if k != "0" else label, id=f"opt{k}", variant=variant))
 
+    def tick_running(self) -> None:
+        """While it works: what it's running and for how long, so a long command isn't
+        mistaken for a stuck screen."""
+        row, log = self.current(), self.query_one("#log", Transcript)
+        line = self.query_one("#running", Static)
+        line.display = bool(row and row["status"] == "working" and log.last_ts)
+        if line.display:
+            if log.calls:
+                label, ts = list(log.calls.values())[-1]
+                line.update(Text(f"▸ {label} · running {since(ts)}"))
+            else:
+                line.update(Text(f"… thinking · {since(log.last_ts)}"))
+
+    def update_queued(self, row: dict[str, Any] | None) -> None:
+        """Messages waiting for the agent to be free; tap one to cancel it."""
+        items = list((row or {}).get("queued") or [])
+        if items == self.queued_shown:
+            return
+        self.queued_shown = items
+        box = self.query_one("#queued", Vertical)
+        box.remove_children()
+        box.display = bool(items)
+        for i, text in enumerate(items):
+            box.mount(Button(f"queued: {first_line(text)}  ✕", name=str(i)))
+
+    @on(Button.Pressed, "#queued Button")
+    async def unqueue_pressed(self, event: Button.Pressed) -> None:
+        if self.selected:
+            i = int(event.button.name or 0)
+            try:
+                await self.rpc("unqueue", id=self.selected, index=i)
+                self.notify("✓ cancelled", timeout=2)
+            except Exception as e:
+                self.notify(str(e), severity="error", timeout=8)
+            await self.poll()
+
     @on(Button.Pressed, "#actions Button")
     async def option_pressed(self, event: Button.Pressed) -> None:
         key = (event.button.id or "")[3:]
@@ -863,26 +1036,33 @@ class Watch(App[None]):
             self.stream(sid)
             self.show_files(self.current())
             self.update_actions(self.current())
+            self.update_queued(self.current())
             self.refresh_bindings()
 
     @work(exclusive=True, group="follow")
     async def stream(self, sid: str) -> None:
+        """Follow the session's events. If the stream drops (e.g. the daemon restarted), keep
+        reconnecting, with the transcript reloaded each time, until another session is picked."""
         log = self.query_one("#log", Transcript)
-        row = self.current()
-        await log.reset(self.narrow, self.markdown, row.get("seen_at") if row else None)
-        try:
-            it = self.follow_fn(sid)
-            first = await anext(it)
-            s = first["session"]
-            self.query_one("#header", Static).update(session_header(s, compact=self.narrow))
-            with self.batch_update():
-                for ev in first["events"]:
+        while True:
+            row = self.current()
+            try:
+                it = self.follow_fn(sid)
+                first = await anext(it)
+                await log.reset(self.narrow, self.markdown, row.get("seen_at") if row else None)
+                s = first["session"]
+                self.query_one("#header", Static).update(session_header(s, compact=self.narrow))
+                with self.batch_update():
+                    for ev in first["events"]:
+                        log.add(ev)
+                self.tick_running()
+                async for ev in it:
                     log.add(ev)
-            # pending approvals: the buttons under the log show the options
-            async for ev in it:
-                log.add(ev)
-        except (OSError, RuntimeError, StopAsyncIteration) as e:
-            log.mount(Static(Text(f"stream ended: {e}", style="dim")))
+            except (OSError, RuntimeError, StopAsyncIteration):
+                pass
+            if self.selected != sid:
+                return
+            await asyncio.sleep(1)
 
     # --- navigation ---
 
@@ -927,8 +1107,10 @@ class Watch(App[None]):
     # --- prompt (send / filter) ---
 
     def open_prompt(self, mode: str, placeholder: str, value: str = "") -> None:
-        self.prompt_mode = mode
+        self.prompt_mode, self.prompt_target = mode, self.selected
         inp = self.query_one("#prompt", Prompt)
+        sends = self.sent.get(self.selected or "", []) if mode in ("send", "queue") else []
+        inp.sends, inp.recall, inp.draft = [s["text"] for s in sends], 0, ""
         inp.placeholder = placeholder
         inp.load_text(value)
         inp.move_cursor(inp.document.end)
@@ -945,17 +1127,10 @@ class Watch(App[None]):
         target = "#log" if self.screen.has_class("detail-view") else "#list"
         self.query_one(target).focus()
 
-    def outside(self) -> bool:
-        """Not something agentctl can type into: say how to fix that rather than do nothing."""
-        r = self.current()
-        if r and not r["controllable"]:
-            msg = f"{short_id(r['id'])} runs outside agentctl: enter moves it here"
-            self.notify(msg, timeout=5)
-            return True
-        return False
-
     def action_send(self) -> None:
-        if self.selected and not self.outside():
+        # Always open the box, even where sending will fail (the error says why and the text is
+        # kept): otherwise what you type next would land on the list as commands (a, d, x, …).
+        if self.selected:
             self.open_prompt(
                 "send", f"message to {short_id(self.selected)} · enter sends · esc cancels"
             )
@@ -972,24 +1147,33 @@ class Watch(App[None]):
 
     @on(Prompt.Submitted)
     async def prompt_submitted(self, event: Prompt.Submitted) -> None:
-        mode = self.prompt_mode
+        mode, target, text = self.prompt_mode, self.prompt_target, event.value
+        placeholder = self.query_one("#prompt", Prompt).placeholder
         self.close_prompt()
-        if mode == "send" and event.value.strip():
-            await self.control("send", text=event.value)
+        if mode in ("send", "queue") and text.strip() and target:
+            ok = await self.control(mode, sid=target, text=text)
+            outcome = self.last_outcome if ok else "failed"
+            at = datetime.now().strftime("%H:%M:%S")
+            entry = {"at": at, "text": text, "outcome": outcome, "error": self.last_error}
+            self.sent.setdefault(target, []).append(entry)
+            if not ok:
+                self.open_prompt(mode, str(placeholder), text)  # failed: keep what was typed
+                self.prompt_target = target
         elif mode == "rename":
-            await self.control("rename", title=event.value)
-        elif mode == "queue" and event.value.strip():
-            await self.control("queue", text=event.value)
+            await self.control("rename", sid=target, title=text)
 
     # --- control ---
 
-    async def control(self, method: str, **params: Any) -> None:
-        if not self.selected:
-            return
+    async def control(self, method: str, sid: str | None = None, **params: Any) -> bool:
+        sid = sid or self.selected
+        if not sid:
+            return False
         try:
-            r = await self.rpc(method, id=self.selected, **params)
+            self.last_error = ""
+            r = await self.rpc(method, id=sid, **params)
             if "queued" in r:
                 method = "queue"
+            self.last_outcome = "queued" if method == "queue" else "sent"
             done = r.get("chosen") or {
                 "send": "sent",
                 "interrupt": "interrupted",
@@ -997,10 +1181,14 @@ class Watch(App[None]):
                 "rename": "renamed",
                 "queue": f"busy: queued ({len(r.get('queued') or [])} waiting)",
             }.get(method, method)
-            self.notify(f"✓ {short_id(self.selected)} {done}", timeout=3)
+            self.notify(f"✓ {short_id(sid)} {done}", timeout=3)
+            ok = True
         except Exception as e:
             self.notify(str(e), severity="error", timeout=8)
+            self.last_error = str(e)
+            ok = False
         await self.poll()
+        return ok
 
     async def action_approve(self) -> None:
         await self.control("approve", allow=True)
@@ -1155,6 +1343,32 @@ class Watch(App[None]):
             await self.poll()
             self.select(sid)
             self.rebuild()
+
+    @work
+    async def action_history(self) -> None:
+        r = self.current()
+        if not r:
+            return
+        arrived: set[str] = set()
+        with contextlib.suppress(Exception):  # which sends show up in its transcript
+            evs = (await self.rpc("tail", id=r["id"], n=500))["events"]
+            arrived = {
+                str(e["payload"].get("text", "")).strip()
+                for e in evs
+                if e["kind"] == "message" and e["payload"].get("role") == "user"
+            }
+        title = r["title"] or short_id(r["id"])
+        text = await self.push_screen_wait(History(title, self.sent.get(r["id"], []), arrived))
+        if text:
+            self.open_prompt("send", f"message to {short_id(r['id'])} · enter sends", text)
+
+    async def action_refresh(self) -> None:
+        """Reload everything: list, transcript, files."""
+        self.shape = []
+        await self.poll()
+        self.restream()
+        self.query_one("#files", Files).reload()
+        self.notify("refreshed", timeout=2)
 
     def action_toggle_markdown(self) -> None:
         self.markdown = not self.markdown

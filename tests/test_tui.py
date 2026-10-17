@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from textual import events
@@ -189,7 +190,7 @@ def test_transcript_folds_tools_and_is_selectable() -> None:
             await pilot.click(groups[0].query_one("CollapsibleTitle"))
             assert not groups[0].collapsed  # tap expands
             stops = set()
-            for _ in range(6):  # Tab moves between panes, never onto the `⚙` lines
+            for _ in range(6):  # Tab moves between panes, never onto the `▸` lines
                 await pilot.press("tab")
                 stops.add(type(app.focused).__name__)
             assert stops <= {"OptionList", "Files", "Transcript"}, stops
@@ -387,3 +388,173 @@ def test_files_of_the_selected_session(tmp_path: Any) -> None:
             assert str(tmp_path.name) in str(app.query_one("#files-title", Static).render())
 
     asyncio.run(run())
+
+
+def test_running_timer_and_queued_messages() -> None:
+    rows = [row("aaaa1111", "working") | {"queued": ["and add tests", "then commit"]}]
+    started = (datetime.now(UTC) - timedelta(seconds=75)).isoformat()
+    call = {"session_id": "aaaa1111", "kind": "tool_call", "ts": started,
+            "payload": {"id": "t1", "name": "Bash", "summary": "pytest -q"}}  # fmt: skip
+
+    class Daemon(Fake):
+        async def rpc(self, method: str, **params: Any) -> Any:
+            if method == "ls":
+                return rows
+            return await super().rpc(method, **params)
+
+        async def follow(self, sid: str) -> AsyncIterator[dict[str, Any]]:
+            yield {"session": rows[0], "events": [call]}
+            await asyncio.Event().wait()
+
+    fake = Daemon()
+
+    async def run() -> None:
+        app = fake.watch()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(0.5)
+            running = str(app.query_one("#running", Static).render())
+            assert "Bash pytest -q · running 1m 1" in running  # ticks while the call runs
+            buttons = list(app.query("#queued Button").results(Button))
+            assert [str(b.label) for b in buttons] == [
+                "queued: and add tests  ✕",
+                "queued: then commit  ✕",
+            ]
+            await pilot.click(buttons[1])  # tap to cancel that one
+            assert ("unqueue", {"id": "aaaa1111", "index": 1}) in fake.calls
+
+    asyncio.run(run())
+
+
+def test_send_never_loses_text_or_changes_target() -> None:
+    from agentctl.tui import Prompt
+
+    class Daemon(Fake):
+        fail = True
+
+        async def rpc(self, method: str, **params: Any) -> Any:
+            if method == "send" and self.fail:
+                self.calls.append((method, params))
+                raise RuntimeError("daemon: connection refused")
+            return await super().rpc(method, **params)
+
+    fake = Daemon()
+
+    async def run() -> None:
+        app = fake.watch()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.select("aaaa1111")
+            await pilot.press("s", *"ship it")
+            app.select("bbbb2222")  # the highlight moves while typing (a rebuild, a tap…)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert ("send", {"id": "aaaa1111", "text": "ship it"}) in fake.calls  # its own target
+            prompt = app.query_one("#prompt", Prompt)
+            assert app.prompt_mode == "send" and prompt.text == "ship it"  # failed: text kept
+            fake.fail = False
+            await pilot.press("enter")
+            await pilot.pause()
+            sends = [p for m, p in fake.calls if m == "send"]
+            assert app.prompt_mode is None and sends == [{"id": "aaaa1111", "text": "ship it"}] * 2
+
+            app.select("cccc3333")  # ended: s still opens the box, so keys can't leak
+            await pilot.press("s", "a", "d")
+            assert app.prompt_mode == "send" and prompt.text == "ad"
+            assert not any(m == "approve" for m, _ in fake.calls)
+
+    asyncio.run(run())
+
+
+def test_transcript_reconnects_when_the_stream_drops() -> None:
+    from agentctl.tui import Transcript
+
+    class Daemon(Fake):
+        tries = 0
+
+        async def follow(self, sid: str) -> AsyncIterator[dict[str, Any]]:
+            self.tries += 1
+            if self.tries == 1:  # first stream dies at once, like a daemon restart
+                raise OSError("connection reset")
+            ev = {"session_id": sid, "kind": "message", "ts": NOW,
+                  "payload": {"role": "user", "text": "after restart"}}  # fmt: skip
+            yield {"session": ROWS[0], "events": [ev]}
+            await asyncio.Event().wait()
+
+    fake = Daemon()
+
+    async def run() -> None:
+        app = fake.watch()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(1.6)
+            texts = [str(w.render()) for w in app.query_one("#log", Transcript).query(Static)]
+            assert fake.tries >= 2 and any("after restart" in t for t in texts)
+
+    asyncio.run(run())
+
+
+def test_send_history_per_session() -> None:
+    from agentctl.tui import History, Prompt
+
+    class Daemon(Fake):
+        async def rpc(self, method: str, **params: Any) -> Any:
+            if method == "send" and params["text"] == "boom":
+                raise RuntimeError("connection refused")
+            if method == "tail":  # only "first" shows up in its transcript
+                ev = {"kind": "message", "payload": {"role": "user", "text": "first"}}
+                return {"session": ROWS[0], "events": [ev]}
+            return await super().rpc(method, **params)
+
+    fake = Daemon()
+
+    async def run() -> None:
+        app = fake.watch()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.select("aaaa1111")
+            for text in ("first", "second"):
+                await pilot.press("s", *text, "enter")
+                await pilot.pause()
+            await pilot.press("s", *"boom", "enter")
+            await pilot.pause()
+            await pilot.press("escape")  # the failed one stays in the box; close it
+            assert [s["outcome"] for s in app.sent["aaaa1111"]] == ["sent", "sent", "failed"]
+
+            await pilot.press("s", "up")  # shell-like recall, newest first
+            prompt = app.query_one("#prompt", Prompt)
+            assert prompt.text == "boom"
+            await pilot.press("up", "up", "down")
+            assert prompt.text == "second"
+            await pilot.press("escape")
+
+            await pilot.press("h")
+            await pilot.pause()
+            assert isinstance(app.screen, History)
+            ol = app.screen.query_one(OptionList)
+            lines = [str(ol.get_option_at_index(i).prompt) for i in range(ol.option_count)]
+            assert "failed" in lines[0] and "connection refused" in lines[0]
+            assert "not in transcript yet" in lines[1] and "second" in lines[1]
+            assert "arrived" in lines[2] and "first" in lines[2]
+            await pilot.press("down", "enter")  # pick "second": back in the send box
+            await pilot.pause()
+            assert app.prompt_mode == "send" and prompt.text == "second"
+
+    asyncio.run(run())
+
+
+def test_row_shows_ls_columns() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from agentctl.tui import row_text
+
+    now = datetime.now(UTC)
+    r = {
+        "id": "abcdef12-0000", "source": "claude_code", "origin": "cli", "status": "idle",
+        "last_activity": now.isoformat(), "title": "t", "cwd": "/x",
+        "context_tokens": 50_000, "context_window": 200_000, "context_window_exact": True,
+        "cache_expires_at": (now + timedelta(minutes=42, seconds=30)).isoformat(),
+    }  # fmt: skip
+    assert " 25% 42m t" in row_text(r).plain
+    assert "idle" in row_text(r, status=True).plain and "idle" not in row_text(r).plain
+    r["cache_expires_at"] = (now - timedelta(minutes=1)).isoformat()
+    bare = {**r, "context_tokens": None}
+    assert row_text(r).plain.index(" t") == row_text(bare).plain.index(" t")  # titles line up

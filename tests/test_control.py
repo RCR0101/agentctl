@@ -51,6 +51,20 @@ def test_send_single_and_multiline(server: tuple[str, str]) -> None:
     assert "GOT:first line" in s and "GOT:second line" in s
 
 
+def test_concurrent_sends_stay_separate(server: tuple[str, str]) -> None:
+    sock, pane = server
+
+    async def both() -> None:
+        await asyncio.gather(
+            *(tmux.send_text(sock, pane, f"msg{i} " + "x" * 300, clear=False) for i in (1, 2))
+        )
+
+    asyncio.run(both())
+    s = screen_after(sock, pane, "GOT:msg2")
+    assert "GOT:msg1 " + "x" * 300 in s.replace("\n", "")
+    assert "GOT:msg2 " + "x" * 300 in s.replace("\n", "")
+
+
 def test_pane_pid_and_descendant(server: tuple[str, str]) -> None:
     sock, pane = server
     root = asyncio.run(tmux.pane_pid(sock, pane))
