@@ -132,7 +132,12 @@ your decision, made ahead of time. Keep allow rules narrow.
 
 ### The dashboard (`agentctl watch`)
 
-The overview shows approvals, unread sessions, running agents and overlapping work. Connection
+The overview shows approvals, unread sessions, running agents and overlapping work.
+Each session in the list is its task, then a quiet line with its project, agent and age; a
+nearly full context or a cache about to expire is added only when it matters, and the id and
+full details are in the selected session's header. A project's parent folder appears only when
+two projects share a name. With many idle sessions, the four most recent show and the rest fold
+into "+N more idle"; `e` shows them all. Connection
 status stays visible; if the daemon disconnects, the last view stays on screen with its age.
 On a desktop, task names lead the session list and the transcript gets most of the space.
 Project files are available with `v`. On desktop, Enter opens the agent's fullscreen terminal;
@@ -196,7 +201,7 @@ On the session list, Esc clears an applied filter. `Ctrl+Q` always exits the das
 | `f` | search what was said in every session (your messages and the replies, not tool output); Enter on a match opens its session |
 | `h` | messages sent through agentctl and their delivery states, saved across dashboard and daemon restarts; select one to reuse it |
 | Enter on a file | its diff since the last commit. `●` marks files the session edited (with an edit tool; edits made through shell commands aren't seen), a dim `●` the folders holding them |
-| `e` | show or hide ended sessions |
+| `e` | show everything: every idle session, and those ended in the last 24h |
 | `m` | raw text instead of rendered Markdown |
 | `b` | bell and a Mac notification with the alerts below |
 | `t` | theme, previewed as you move through the list; the pick is remembered |
@@ -431,4 +436,4 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy
 
 Fresh agent messages accept an explicit intended `model`; omitted models use the agent default. Team workers can save a default with `teams add --model`, and `teams assign --model` overrides it per assignment (an empty value requests the agent default). Assignment and message receipts record the requested/defaulted selection; they do not establish the effective runtime model. Model requests never resume user chats.
 
-Watch shows ended sessions whose last activity is within 24 hours. `e` toggles those rows; `f` searches older history. Hidden rows remain hidden until unhidden or new activity restores them. Delivery holds show the reason beside queued work; inspect the terminal and sent history before retrying an uncertain send.
+Watch shows ended sessions whose last activity is within 24 hours. `e` toggles those rows, and every idle session; `f` searches older history. Hidden rows remain hidden until unhidden or new activity restores them. Delivery holds show the reason beside queued work; inspect the terminal and sent history before retrying an uncertain send.

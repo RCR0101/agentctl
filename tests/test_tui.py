@@ -8,7 +8,7 @@ from typing import Any
 from textual import events
 from textual.widgets import Button, OptionList, Static
 
-from agentctl.tui import Watch
+from agentctl.tui import IDLE_SHOWN, Watch
 
 NOW = "2026-10-15T12:00:00+00:00"
 
@@ -379,9 +379,8 @@ def test_projects_digest_queue_and_divider() -> None:
             ol = app.query_one("#list", OptionList)
             await pilot.press("p")
             heads = [str(ol.get_option_at_index(i).prompt) for i in range(ol.option_count)]
-            assert heads[0].startswith(" api · w (1)") and any(
-                h.startswith(" web · w (1)") for h in heads
-            )
+            # the parent folder only appears when two projects share a name
+            assert heads[0].startswith(" api (1)") and any(h.startswith(" web (1)") for h in heads)
             assert "2 new" in heads[1]  # unread badge on the card
 
             await pilot.press("u")
@@ -598,12 +597,13 @@ def test_row_shows_ls_columns() -> None:
         "context_tokens": 50_000, "context_window": 200_000, "context_window_exact": True,
         "cache_expires_at": (now + timedelta(minutes=42, seconds=30)).isoformat(),
     }  # fmt: skip
-    assert row_text(r).plain.splitlines()[0] == "t"
-    assert "25% · 42m" in row_text(r).plain
+    assert row_text(r).plain.splitlines() == ["t", "x · cc · 0s"]  # quiet when all is well
+    assert "abcdef12" not in row_text(r).plain  # the id is in the selected session's header
     assert "idle" in row_text(r, status=True).plain and "idle" not in row_text(r).plain
-    r["cache_expires_at"] = (now - timedelta(minutes=1)).isoformat()
-    bare = {**r, "context_tokens": None}
-    assert row_text(r).plain.splitlines()[0] == row_text(bare).plain.splitlines()[0]
+    full = r | {"context_tokens": 170_000, "status": "awaiting_input"}
+    full["cache_expires_at"] = (now + timedelta(minutes=3, seconds=30)).isoformat()
+    assert row_text(full).plain.splitlines()[1] == "x · cc · 0s · 85% · cache 3m"
+    assert row_text(r, project="x · work").plain.splitlines()[1].startswith("x · work · ")
 
 
 def test_phone_card_says_what_it_needs() -> None:
@@ -613,7 +613,8 @@ def test_phone_card_says_what_it_needs() -> None:
         "preview": {"kind": "assistant", "text": "I fixed **the** [parser](http://x) " * 9}
     }
     lines = card_text(r, width=40).plain.splitlines()
-    assert lines[0] == "▌ fix parser" and lines[1].startswith("▌ aaaa1111 · cc · ")
+    assert lines[0] == "▌ fix parser" and lines[1].startswith("▌ proj · cc · ")
+    assert "input" not in lines[1]  # its group heading says so
     assert lines[2] == "▌ ◆ I fixed the parser I fixed the"  # Markdown's marks dropped
     assert len(lines) == 4 and lines[3].endswith("…") and all(len(x) <= 40 for x in lines)
     appr = card_text(row("bbbb2222", "awaiting_approval")).plain.splitlines()
@@ -1424,5 +1425,50 @@ def test_ended_only_empty_state_explains_recent_boundary_in_both_groups() -> Non
                 app.action_toggle_ended()
                 assert not empty.has_class("show")
                 assert app.query_one("#list", OptionList).get_option("recent-ended")
+
+    asyncio.run(run())
+
+
+def test_project_labels_add_the_parent_only_on_a_clash() -> None:
+    from agentctl.tui.presentation import project_labels
+
+    rows = [
+        row("aaaa1111", "idle") | {"cwd": "/w/work/api", "project": "api"},
+        row("bbbb2222", "idle") | {"cwd": "/w/home/api", "project": "api"},
+        row("cccc3333", "idle") | {"cwd": "/w/work/web", "project": "web"},
+    ]
+    assert project_labels(rows) == {
+        "aaaa1111": "api · work", "bbbb2222": "api · home", "cccc3333": "web"
+    }  # fmt: skip
+
+
+def test_long_idle_list_folds_and_e_shows_it() -> None:
+    idle = [
+        row(f"{i:04d}0000", "idle", title=f"task {i}")
+        | {"last_activity": (datetime.now(UTC) - timedelta(minutes=i)).isoformat()}
+        for i in range(9)
+    ]
+
+    class Many(Fake):
+        async def rpc(self, method: str, **params: Any) -> Any:
+            if method == "ls":
+                return [row("aaaa1111", "working"), *idle]
+            return await super().rpc(method, **params)
+
+    async def run() -> None:
+        app = Many().watch()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            ol = app.query_one("#list", OptionList)
+            texts = [str(ol.get_option_at_index(i).prompt) for i in range(ol.option_count)]
+            assert any("IDLE (9)" in t for t in texts)  # the heading counts them all
+            assert sum("task " in t for t in texts) == IDLE_SHOWN  # the latest few
+            assert any("+5 more idle · e shows all" in t for t in texts)
+            await pilot.press("e")
+            await pilot.pause()
+            texts = [str(ol.get_option_at_index(i).prompt) for i in range(ol.option_count)]
+            assert sum("task " in t for t in texts) == 9 and not any(
+                "more idle" in t for t in texts
+            )
 
     asyncio.run(run())

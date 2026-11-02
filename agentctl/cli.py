@@ -337,8 +337,6 @@ def session_notes(s: dict[str, Any]) -> list[Text]:
                 style="dim",
             )
         )
-    else:
-        notes.append(Text("Lifecycle evidence: unknown (no observation recorded)", style="dim"))
     if not s.get("controllable") and s.get("control_reason"):
         notes.append(Text(s["control_reason"], style="dim"))
     if s.get("queued"):

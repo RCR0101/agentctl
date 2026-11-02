@@ -149,7 +149,7 @@ HELP = [
         ("p", "group by project / by status"),
         ("/", "filter by id, title or folder"),
         ("f", "search what was said in every session"),
-        ("e", "show or hide ended (last 24h); search older history"),
+        ("e", "show everything: all idle sessions, and ended (last 24h)"),
         ("q", "quit"),
     ]),
     ("session", [

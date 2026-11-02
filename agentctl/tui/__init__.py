@@ -58,13 +58,12 @@ from agentctl.cli import (
     render,
     session_header,
     short_cwd,
-    status_text,
     usage_text,
 )
 from agentctl.models import short_id
 from agentctl.tui.common import Rpc, nocase, sent_key
 from agentctl.tui.composer import ControlResult, Prompt
-from agentctl.tui.presentation import card_text, group_heading, row_text
+from agentctl.tui.presentation import card_text, group_heading, project_labels, row_text
 from agentctl.tui.review import Review
 from agentctl.tui.screens import (
     Confirm,
@@ -143,6 +142,12 @@ GROUPS = [
     ("ended", "ENDED, last 24h"),
 ]
 NARROW = 80
+PROJECT_COUNTS = (
+    ("awaiting_approval", "approve"),
+    ("awaiting_input", "input"),
+    ("working", "working"),
+)
+IDLE_SHOWN = 4  # idle sessions listed before the rest fold into a "+N more" line
 # Phone: (label, action) along the bottom of each page, and under its "more" (only what applies)
 TAPBAR = {
     "list": [("+ new", "new"), ("search", "search"), ("unread", "digest"), ("more", "menu")],
@@ -518,7 +523,8 @@ class Watch(App[None]):
         self.empty_shown = ""
         self.approvals: set[str] | None = None  # None until the first poll
         self.shape: list[tuple[Any, ...]] = []
-        self.show_ended = False
+        self.show_ended = False  # e: also every idle session, and ended ones
+        self.labels: dict[str, str] = {}  # session -> project label, parent only on clashes
         self.markdown = True  # render replies as Markdown; `m` shows the raw text
         self.actions_shown: tuple[Any, ...] | None = None  # tool, options and control availability
         self.queued_shown: Any | None = None
@@ -873,7 +879,12 @@ class Watch(App[None]):
 
     def action_toggle_ended(self) -> None:
         self.show_ended = not self.show_ended
-        self.notify("Ended: last 24h by activity; f searches older history", timeout=5)
+        self.notify(
+            "Showing every idle session, and those ended in the last 24h; f searches older"
+            if self.show_ended
+            else f"Idle folded to the {IDLE_SHOWN} most recent; ended hidden",
+            timeout=5,
+        )
         self.rebuild()
 
     def rebuild(self) -> None:
@@ -916,23 +927,34 @@ class Watch(App[None]):
                 r.get("project"), r["source"], r.get("origin"),
             )
             for r in rows
-        ] + [(self.show_ended, self.by_project)]  # fmt: skip
+        ] + [(self.show_ended, self.by_project, self.card_width())]  # fmt: skip
         if shape != self.shape:
             self.shape = shape
             ol = self.query_one("#list", OptionList)
+            self.labels = project_labels(rows)
             opts: list[Option | None] = self.project_options(rows) if self.by_project else []
+            everything = self.show_ended or bool(self.filter)
             for status, label in [] if self.by_project else GROUPS:
                 group = [r for r in rows if r["status"] == status]
                 if not group:
                     continue
-                folded = status == "ended" and not self.show_ended and not self.filter
+                folded = status == "ended" and not everything
+                # a long idle list would push what's running off the screen: keep the latest
+                hidden = 0
+                if status == "idle" and not everything and len(group) > IDLE_SHOWN + 1:
+                    group, hidden = group[:IDLE_SHOWN], len(group) - IDLE_SHOWN
                 more = " · e shows" if folded else ""
-                head = group_heading(status, label, len(group), self.card_width(), more)
+                total = len(group) + hidden
+                head = group_heading(status, label, total, self.card_width(), more)
                 opts.append(Option(head, disabled=True))
                 if not folded:
                     opts += self.cards(group) if self.narrow else [
-                        Option(row_text(r), id=r["id"]) for r in group
+                        Option(row_text(r, project=self.labels.get(r["id"])), id=r["id"])
+                        for r in group
                     ]  # fmt: skip
+                if hidden:
+                    note = Text(f"  +{hidden} more idle · e shows all", style="dim italic")
+                    opts.append(Option(note, disabled=True))
             ids = [o.id for o in opts if o]
             if ids == [o.id for o in ol.options]:  # same rows in place: new text, no relayout
                 for i, o in enumerate(o for o in opts if o):
@@ -995,10 +1017,14 @@ class Watch(App[None]):
         )
 
     def cards(self, group: list[dict[str, Any]], folder: bool = True) -> list[Option | None]:
-        """Phone cards, a rule between each (None: OptionList's divider)."""
+        """Phone cards, a rule between each (None: OptionList's divider). In the project view
+        (folder=False) the heading names the project, so cards show the status instead."""
         out: list[Option | None] = []
         for r in group:
-            out += [Option(card_text(r, self.card_width(), folder), id=r["id"]), None]
+            card = card_text(
+                r, self.card_width(), folder, status=not folder, project=self.labels.get(r["id"])
+            )
+            out += [Option(card, id=r["id"]), None]
         return out[:-1]
 
     def project_options(self, rows: list[dict[str, Any]]) -> list[Option | None]:
@@ -1013,15 +1039,25 @@ class Watch(App[None]):
             ).append(r)
         opts: list[Option | None] = []
         for _, group in projects.items():  # rows are sorted, so is this
-            name = project_display(group[0])
-            head = Text(f" {name} ({len(group)}) ", style="bold")
-            for status in ("awaiting_approval", "awaiting_input", "working"):
-                n = sum(r["status"] == status for r in group)
-                if n:
-                    head.append(f"{n} ").append_text(status_text(status)).append(" ")
+            name = self.labels.get(group[0]["id"]) or project_display(group[0])
+            counts = [
+                f"{n} {word}"
+                for status, word in PROJECT_COUNTS
+                if (n := sum(r["status"] == status for r in group))
+            ]
+            more = f" · {' · '.join(counts)}" if counts else ""
+            head = Text(
+                f" {name} ({len(group)}){more} ",
+                style="bold reverse",
+                no_wrap=True,
+                overflow="crop",
+            )
+            width = max(self.card_width(), 1)
+            head.truncate(width, overflow="crop")
+            head.pad_right(max(width - head.cell_len, 0))
             opts.append(Option(head, disabled=True))
             opts += self.cards(group, folder=False) if self.narrow else [
-                Option(row_text(r, status=True), id=r["id"]) for r in group
+                Option(row_text(r, status=True, folder=False), id=r["id"]) for r in group
             ]  # fmt: skip
         if not self.show_ended and not self.filter:
             opts.append(
