@@ -101,6 +101,14 @@ matches several live sessions, agentctl asks which one on a terminal (scripts ge
 listing them); an id prefix must be unique. Tab completes ids and names once you run
 `agentctl --install-completion`.
 
+On a terminal you can also leave the session out: `agentctl tail`, `approve`, `deny`,
+`interrupt`, `wait`, `attach` and `close` open a list to pick from (arrows or ctrl-p/n to move,
+type to filter, Enter picks, Esc cancels), showing only the sessions that command applies to.
+`agentctl approve` on its own shows what the agent wants to run and lets you pick the answer,
+and `agentctl send <name>` without a message asks for it. A session name that doesn't match
+suggests the ones you probably meant. None of this happens in scripts: without a terminal,
+or with `--json`, the session must be named and the output stays plain.
+
 `agentctl wait` exits 0 when the turn finished, 2 if it stopped for approval, 3 on timeout,
 4 if nothing was running and 5 if a delivery is uncertain, so scripts can chain agents:
 `agentctl send api "add the endpoint" -w > api.md && agentctl send web "$(cat api.md)"`.

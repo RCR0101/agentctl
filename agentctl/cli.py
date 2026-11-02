@@ -11,7 +11,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,7 +23,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from agentctl import HOME, LOG_DIR, SOCKET_PATH, hooks, launcher
+from agentctl import HOME, LOG_DIR, SOCKET_PATH, hooks, launcher, ui
 from agentctl.ids import short_id
 from agentctl.setup import LABEL, PLIST
 from agentctl.teams_cli import app as teams_app
@@ -75,6 +75,16 @@ IdArg = Annotated[
         autocompletion=complete_session,
     ),
 ]
+OptIdArg = Annotated[
+    str | None,
+    typer.Argument(
+        help="Session id prefix, name or folder; @ for the one waiting on you; none: pick one.",
+        autocompletion=complete_session,
+        show_default=False,
+    ),
+]
+
+
 SendIdArg = Annotated[
     str,
     typer.Argument(
@@ -198,9 +208,28 @@ def rpc(method: str, as_json: bool, **params: Any) -> Any:
         return call(method, **params)
     except DaemonError as e:
         if e.choices and "id" in params and not as_json and _interactive():
-            picked = pick_session(str(params["id"]), e.choices)
+            picked = choose_session(f"{params['id']!r} matches several:", e.choices)
+            if picked is None:
+                raise typer.Exit(1) from None
             return rpc(method, as_json, **(params | {"id": picked}))
+        if str(e).startswith("no session matches") and "id" in params and not as_json:
+            fail(str(e), as_json, did_you_mean(str(params["id"])))
         fail(str(e), as_json)
+
+
+def did_you_mean(ref: str) -> list[Text]:
+    """After a miss: the sessions that look like what was typed, and how to see them all."""
+    try:
+        rows = call("ls", autostart=False, all=True)
+    except (DaemonError, OSError):
+        return []
+    lines = [
+        Text().append("did you mean ", style=ui.DIM) + ui.glyph(r["status"])
+        + Text().append(f" {ui.project(r)}", style=ui.ACCENT) + Text(f"  {ui.title(r)}  ")
+        + Text(short_id(r["id"]), style=ui.DIM)
+        for r in ui.suggest(ref, rows)
+    ]  # fmt: skip
+    return [*lines, ui.hint("agentctl ls -a", "agentctl  (pick from a list)")]
 
 
 def resolve(ref: str, as_json: bool) -> str:
@@ -211,38 +240,55 @@ def resolve(ref: str, as_json: bool) -> str:
 
 
 def _interactive() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty()
+    return ui.interactive()
 
 
-def pick_session(ref: str, choices: list[dict[str, Any]]) -> str:
-    """Ask which of several matching sessions was meant. Only on a terminal: scripts get the
-    error, so a send never goes somewhere by guesswork."""
-    err.print(Text(f"{ref!r} matches {len(choices)} sessions:", style="yellow"))
-    for i, c in enumerate(choices, 1):
-        line = Text(f" {i:>2}  ", style="bold").append(short_id(c["id"]), style="bold")
-        line.append("  ").append_text(status_text(c["status"]))
-        line.append(f"  {c['label']}").append(f"  {short_cwd(c.get('cwd') or '')}", style="blue")
-        err.print(line)
-    answer = typer.prompt(f"which one? 1-{len(choices)}, Enter cancels", default="",
-                          show_default=False, err=True).strip()  # fmt: skip
-    if answer.isdigit() and 1 <= int(answer) <= len(choices):
-        return str(choices[int(answer) - 1]["id"])
-    raise typer.Exit(1)
+def choose_session(prompt: str, rows: list[dict[str, Any]]) -> str | None:
+    """The inline picker over these sessions (the daemon's ambiguity choices carry a label,
+    status and folder; `ls` rows carry everything)."""
+    full = [
+        r if "source" in r else {
+            "id": r["id"], "status": r["status"], "title": r.get("label"), "cwd": r.get("cwd", ""),
+            "source": "claude_code", "last_activity": datetime.now(UTC).isoformat(),
+        }
+        for r in rows
+    ]  # fmt: skip
+    return ui.pick_session(full, prompt, err)
 
 
-def fail(msg: str, as_json: bool) -> NoReturn:
+def pick_or_fail(
+    id: str | None, as_json: bool, prompt: str, want: Callable[[dict[str, Any]], bool]
+) -> str:
+    """The session named, or on a terminal a pick from those `want` keeps (the most urgent
+    first). Scripts must name one."""
+    if id is not None:
+        return id
+    if as_json or not _interactive():
+        fail("which session? give an id, name or folder, or @ for the one waiting on you", as_json)
+    rows = [r for r in rpc("ls", as_json) if want(r)]
+    if not rows:
+        fail("no session to choose from here", as_json, [ui.hint("agentctl ls -a")])
+    picked = choose_session(prompt, rows)
+    if picked is None:
+        raise typer.Exit(1)
+    return picked
+
+
+def fail(msg: str, as_json: bool, hints: list[Text] | None = None) -> NoReturn:
     if as_json:
         print(json.dumps({"error": msg}))
     else:
-        err.print(Text("error: ", style="bold red") + Text(msg))
+        err.print(ui.failure(msg[:1].upper() + msg[1:]))
+        for h in hints or []:
+            err.print(Text("  ") + h)
     raise typer.Exit(1)
 
 
-def ok(msg: str, as_json: bool, result: Any) -> None:
+def ok(msg: str, as_json: bool, result: Any, detail: str = "") -> None:
     if as_json:
         print(json.dumps(result))
     else:
-        out.print(Text("ok: ", style="bold green") + Text(msg))
+        out.print(ui.success(msg[:1].upper() + msg[1:], detail))
 
 
 # --- formatting ---
@@ -453,42 +499,55 @@ def main(ctx: typer.Context) -> None:
 
     Run with no command for a short summary of what needs you."""
     if ctx.invoked_subcommand is None:
-        out.print(summary_view(rpc("ls", False)))
+        out.print(summary_view(rpc("ls", False), out.width))
 
 
-def summary_view(rows: list[dict[str, Any]]) -> Group:
-    """What `agentctl` alone prints: what needs you, what's running, and what to type next."""
-    needs = [r for r in rows if r["status"] in ("awaiting_approval", "awaiting_input")]
-    working = [r for r in rows if r["status"] == "working"]
+def headline(rows: list[dict[str, Any]]) -> Text:
+    """`2 need you · 2 working · 2 unread · 7 sessions`: the counts that matter, coloured only
+    when they're not zero."""
+    needs = sum(r["status"] in ("awaiting_approval", "awaiting_input") for r in rows)
+    working = sum(r["status"] == "working" for r in rows)
     unread = sum(1 for r in rows if r.get("unread"))
-    head = Text()
+    t = Text()
+    for i, (n, word, style) in enumerate(
+        ((needs, "need you", "bold yellow"), (working, "working", "green"),
+         (unread, "unread", "cyan"), (len(rows), "sessions", ""))
+    ):  # fmt: skip
+        if i:
+            t.append("  ·  ", style=ui.DIM)
+        t.append(f"{n} {word}", style=style if n else ui.DIM)
+    return t
+
+
+def summary_view(rows: list[dict[str, Any]], width: int = 100) -> Group:
+    """What `agentctl` alone prints: the counts, what needs you (with how to answer it), what
+    looks wrong, and what to type next."""
     if not rows:
-        head.append("No sessions yet. ", style="bold")
-        head.append("Start one with `agentctl new claude .`, or just run claude/codex/opencode.")
-        return Group(head)
-    head.append(f"{len(needs)} need you", style="bold yellow" if needs else "dim")
-    head.append(" · ").append(f"{len(working)} working", style="green" if working else "dim")
-    head.append(" · ").append(f"{unread} with unread replies", style="cyan" if unread else "dim")
-    parts: list[Any] = [head]
+        return Group(
+            Text("No sessions yet.", style="bold"),
+            ui.hint("agentctl new claude .", "or run claude, codex or opencode as usual"),
+        )
+    parts: list[Any] = [headline(rows), Text("")]
+    needs = [r for r in rows if r["status"] in ("awaiting_approval", "awaiting_input")]
     for r in needs[:5]:
-        ref, name = short_id(r["id"]), r["title"] or short_cwd(r["cwd"])
-        line = Text("  ").append_text(status_text(r["status"])).append(f" {ref} ", style="bold")
-        line.append(name, style="")
-        if r["status"] == "awaiting_approval":
-            what = (r.get("pending_approval") or {}).get("tool") or "?"
-            line.append(f"  wants {what}", style="dim")
-            line.append(f"\n      agentctl approve {ref} · agentctl deny {ref}", style="dim")
-        else:
-            line.append(f'\n      agentctl tail {ref} · agentctl send {ref} "…"', style="dim")
-        parts.append(line)
+        parts.append(ui.session_line(r, width, stuck_minutes(r), context_full(r)))
+        parts += ui.tree(ui.session_details(r, stuck_minutes(r), context_full(r)))
     if len(needs) > 5:
-        parts.append(Text(f"  and {len(needs) - 5} more: agentctl ls -m", style="dim"))
-    parts += attention_notes(rows)
-    parts.append(
-        Text("\nagentctl watch", style="bold").append(" for the dashboard · ", style="dim")
-        .append("agentctl ls", style="bold").append(" for everything · ", style="dim")
-        .append("agentctl --help", style="bold").append(" for all commands", style="dim")
-    )  # fmt: skip
+        parts.append(ui.note(f"and {len(needs) - 5} more · agentctl ls -m"))
+    trouble = [r for r in rows if r not in needs and (stuck_minutes(r) or context_full(r))]
+    for r in trouble[:5]:
+        parts.append(ui.session_line(r, width, stuck_minutes(r), context_full(r)))
+        parts += ui.tree(ui.session_details(r, stuck_minutes(r), context_full(r)))
+    if not needs and not trouble:
+        parts.append(ui.note("Nothing needs you right now.", style="green"))
+    parts.append(Text(""))
+    first = needs[0] if needs else None
+    if first and first["status"] == "awaiting_approval":
+        parts.append(ui.hint("agentctl approve @", "agentctl approve  (choose)", "agentctl watch"))
+    elif first:
+        parts.append(ui.hint(f"agentctl tail {short_id(first['id'])}", "agentctl watch"))
+    else:
+        parts.append(ui.hint("agentctl watch", "agentctl ls", "agentctl --help"))
     return Group(*parts)
 
 
@@ -550,61 +609,34 @@ def _within(cwd: str, root: str) -> bool:
     return bool(cwd) and (cwd == root or cwd.startswith(root.rstrip("/") + "/"))
 
 
+LS_GROUPS = (
+    ("Needs you", ("awaiting_approval", "awaiting_input")),
+    ("Working", ("working",)),
+    ("Idle", ("idle",)),
+    ("Ended", ("ended",)),
+)
+
+
 def ls_view(rows: list[dict[str, Any]], width: int) -> Group:
-    """The `ls` table plus what needs a look: counts, overlaps, quiet sessions, approvals."""
+    """Sessions grouped by what they need from you, one line each, with a tree of details
+    (what it wants, what's wrong) only where there's something to say."""
     if not rows:
-        return Group(Text("no sessions", style="dim"))
-    narrow = width < 70  # phone portrait: drop cwd and source, keep title
-    t = Table(box=None, pad_edge=False, header_style="bold dim", expand=True)
-    t.add_column("ID", no_wrap=True, min_width=8, style="bold")
-    if not narrow:
-        t.add_column("SRC", no_wrap=True, min_width=3)
-    t.add_column("STATUS", no_wrap=True, min_width=7)
-    t.add_column("AGE", no_wrap=True, justify="right", min_width=3, style="dim")
-    if not narrow:
-        t.add_column("CTX", no_wrap=True, justify="right")
-        t.add_column("CACHE", no_wrap=True, justify="right")
-        t.add_column("CWD", no_wrap=True, overflow="ellipsis", max_width=18, style="blue")
-    t.add_column("TITLE", no_wrap=True, overflow="ellipsis", ratio=1)
-    t.add_column("C", no_wrap=True, min_width=1)
-    for r in rows:
-        cells: list[str | Text] = [short_id(r["id"])]
-        if not narrow:
-            cells.append(agent_label(r))
-        cells += [status_text(r["status"]), age(r["last_activity"])]
-        if not narrow:
-            cells += [ctx_text(r, short=True), cache_text(r), short_cwd(r["cwd"])]
-        title = Text()
-        if r.get("unread"):
-            title.append(f"{r['unread']} new ", style="bold cyan")
-        if r.get("conflicts"):
-            title.append("! ", style="yellow")
-        if (stuck := stuck_minutes(r)) is not None:
-            title.append(f"quiet {stuck}m ", style="bold yellow")
-        title.append(
-            r["title"] or short_cwd(r["cwd"]), style="dim" if r["status"] == "ended" else ""
-        )
-        ctl = Text("●", style="green") if r["controllable"] else Text("·", style="dim")
-        t.add_row(*cells, title, ctl)
-    parts: list[Any] = [t]
-    counts: dict[str, int] = {}
-    for r in rows:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
-    summary = Text()
-    for st in ("awaiting_approval", "awaiting_input", "working"):
-        if counts.get(st):
-            summary.append(f"{counts[st]} {STATUS_SHORT[st]}  ", style=STATUS_STYLE[st])
-    if stuck_n := sum(stuck_minutes(r) is not None for r in rows):
-        summary.append(f"{stuck_n} maybe stuck  ", style="bold yellow")
-    summary.append("● = controllable", style="dim")
-    parts.append(summary)
-    for r in rows:
-        for c in r.get("conflicts") or []:
-            parts.append(Text(f"! {short_id(r['id'])} {c}", style="yellow"))
-    parts += attention_notes(rows)
-    for r in rows:
-        if r["status"] == "awaiting_approval" and r["pending_approval"]:
-            parts.append(approval_panel(r["id"], r["pending_approval"], r["controllable"]))
+        return Group(Text("No sessions.", style="bold"), ui.hint("agentctl ls -a", "agentctl new"))
+    parts: list[Any] = [headline(rows)]
+    for label, statuses in LS_GROUPS:
+        group = [r for r in rows if r["status"] in statuses]
+        if not group:
+            continue
+        parts += [Text(""), ui.section(label, len(group), style="bold")]
+        for r in group:
+            stuck, full = stuck_minutes(r), context_full(r)
+            parts.append(ui.session_line(r, width, stuck, full))
+            parts += ui.tree(ui.session_details(r, stuck, full))
+    parts.append(Text(""))
+    if any(r["status"] == "awaiting_approval" for r in rows):
+        parts.append(ui.hint("agentctl approve", "agentctl tail <name>", "agentctl watch"))
+    else:
+        parts.append(ui.hint("agentctl tail <name>", 'agentctl send <name> "…"', "agentctl watch"))
     return Group(*parts)
 
 
@@ -615,13 +647,13 @@ def attention_notes(rows: list[dict[str, Any]]) -> list[Text]:
         ref = short_id(r["id"])
         if (stuck := stuck_minutes(r)) is not None:
             notes.append(
-                Text(f"? {ref} working but no output for {stuck}m: ", style="yellow")
+                Text().append(f"? {ref} working but no output for {stuck}m: ", style="yellow")
                 + Text(f"agentctl attach {ref}, or agentctl interrupt {ref}", style="dim")
             )
         if (pct := context_full(r)) is not None:
             hint = "/compact" if r["source"] == "claude_code" else "a fresh session"
             notes.append(
-                Text(f"? {ref} has used {pct}% of its context: ", style="yellow")
+                Text().append(f"? {ref} has used {pct}% of its context: ", style="yellow")
                 + Text(f"consider {hint} before the next big task", style="dim")
             )
     return notes
@@ -629,14 +661,16 @@ def attention_notes(rows: list[dict[str, Any]]) -> list[Text]:
 
 @app.command()
 def tail(
-    id: IdArg,
+    id: OptIdArg = None,
     n: Annotated[int, typer.Option("-n", help="Number of recent events.")] = 50,
     follow: Annotated[bool, typer.Option("--follow", "-f", help="Keep streaming.")] = False,
     raw: Annotated[bool, typer.Option("--raw", help="Show replies as plain text.")] = False,
     as_json: JsonOpt = False,
 ) -> None:
-    """Show a session's recent transcript, optionally live."""
-    id = resolve(id, as_json)
+    """Show a session's recent transcript, optionally live.
+
+    With no session on a terminal, pick one from a list."""
+    id = resolve(pick_or_fail(id, as_json, "read:", lambda r: True), as_json)
     try:
         it = stream("follow", id=id, n=n) if follow else iter([call("tail", id=id, n=n)])
         first = next(it)
@@ -647,12 +681,17 @@ def tail(
         for ev in first["events"]:
             print(json.dumps(ev), flush=True)
     else:
-        narrow = out.width < 70
-        out.print(session_header(s, compact=narrow))
+        out.print(ui.session_header(s))
         for ev in first["events"]:
-            out.print(render(ev, narrow=narrow, markdown=not raw))
+            if (shown := ui.event(ev, not raw, out.width, ui.AGENT[s["source"]])) is not None:
+                out.print(shown)
         if s["status"] == "awaiting_approval" and s["pending_approval"]:
-            out.print(approval_panel(s["id"], s["pending_approval"], s["controllable"]))
+            out.print()
+            out.print(ui.approval_card(s))
+        elif not follow:
+            ref = short_id(s["id"])
+            out.print()
+            out.print(ui.hint(f'agentctl send {ref} "…"', f"agentctl tail {ref} -f"))
     if n:
         with contextlib.suppress(DaemonError):
             call("seen", id=s["id"])  # you've now read it
@@ -660,8 +699,12 @@ def tail(
         for ev in it:
             if as_json:
                 print(json.dumps(ev), flush=True)
-            else:
-                out.print(render(ev, live=True, narrow=out.width < 70, markdown=not raw))
+            elif ev["kind"] == "approval_request":
+                with contextlib.suppress(DaemonError):
+                    out.print()
+                    out.print(ui.approval_card(call("tail", id=s["id"], n=0)["session"]))
+            elif (shown := ui.event(ev, not raw, out.width, ui.AGENT[s["source"]])) is not None:
+                out.print(shown)
     except KeyboardInterrupt:
         pass
 
@@ -669,7 +712,13 @@ def tail(
 @app.command()
 def send(
     id: SendIdArg,
-    message: Annotated[str, typer.Argument(help='Text to send, or "-" to read stdin.')],
+    message: Annotated[
+        str | None,
+        typer.Argument(
+            help='Text to send, or "-" to read stdin. Left out on a terminal: asks for it.',
+            show_default=False,
+        ),
+    ] = None,
     when_idle: Annotated[
         bool,
         typer.Option("--when-idle", "-l", help="Queue it even if the agent is free now."),
@@ -695,32 +744,44 @@ def send(
 
     If it's mid-turn, the message is queued and sent once the agent is free (--now sends it
     anyway)."""
+    if message is None:
+        if as_json or not _interactive():
+            fail('what to send? give the text, or "-" to read it from stdin', as_json)
+        target = rpc("tail", False, id=id, n=0)["session"]
+        id = target["id"]
+        who = ui.glyph(target["status"]).append(f" {ui.title(target)}", style="bold")
+        err.print(who.append(f"  {ui.project(target)} · {short_id(id)}", style=ui.DIM))
+        from rich.prompt import Prompt
+
+        message = Prompt.ask(Text("message", style=f"bold {ui.ACCENT}"), console=err)
     text = sys.stdin.read().rstrip("\n") if message == "-" else message
     if not text.strip():
         fail("empty message", as_json)
     if when_idle:
         r = rpc("queue", as_json, id=id, text=text)
         n = len(r["queued"])
-        ok(f"queued for {short_id(r['session_id'])} ({n} waiting)", as_json, r)
+        ok(
+            f"queued for {short_id(r['session_id'])}",
+            as_json,
+            r,
+            f"{n} waiting · sent once it's free",
+        )
     else:
         r = rpc("send", as_json, id=id, text=text, now=now)
         if "queued" in r:
             n = len(r["queued"])
-            ok(f"{short_id(r['session_id'])} is busy: queued ({n} waiting)", as_json, r)
+            ok(f"queued for {short_id(r['session_id'])}", as_json, r, f"it's busy · {n} waiting")
         else:
             lines = text.count("\n") + 1
-            ok(
-                f"sent to {short_id(r['session_id'])}" + (f" ({lines} lines)" if lines > 1 else ""),
-                as_json,
-                r,
-            )
+            more = f"{lines} lines" if lines > 1 else ""
+            ok(f"sent to {short_id(r['session_id'])}", as_json, r, more)
     if wait_:
         _wait(r["session_id"], timeout, quiet=False, as_json=as_json)
 
 
 @app.command()
 def wait(
-    id: IdArg,
+    id: OptIdArg = None,
     timeout: Annotated[int, typer.Option(help="Give up after this many seconds.")] = 600,
     quiet: Annotated[bool, typer.Option("--quiet", "-q", help="Don't print the reply.")] = False,
     as_json: JsonOpt = False,
@@ -730,25 +791,47 @@ def wait(
     Waits through queued follow-ups too. Exit status: 0 done, 2 stopped for approval,
     3 timed out, 4 nothing was running, 5 delivery uncertain or undeliverable. The reply goes
     to stdout and the status to stderr, so `agentctl wait api > reply.md` keeps just the reply.
-    Polls the local daemon only; no tokens are spent waiting."""
-    _wait(id, timeout, quiet, as_json)
+    Polls the local daemon only; no tokens are spent waiting. With no session on a terminal,
+    pick one of those working."""
+    busy = lambda r: r["status"] in ("working", "awaiting_approval")  # noqa: E731
+    _wait(pick_or_fail(id, as_json, "wait for:", busy), timeout, quiet, as_json)
 
 
 def _wait(ref: str, timeout: int, quiet: bool, as_json: bool) -> None:
     ref = resolve(ref, as_json)
+    started = time.monotonic()
+    status = None
+    if err.is_terminal and not as_json:
+        status = err.status("waiting…", spinner="dots", spinner_style=ui.ACCENT)
+        status.start()
+
+    def show(s: dict[str, Any]) -> None:
+        if status is not None:
+            took = int(time.monotonic() - started)
+            line = Text().append(f"{ui.title(s)}  ", style="bold") + ui.status_label(s["status"])
+            line.append(f"  {took // 60}:{took % 60:02d}", style=ui.DIM)
+            if s.get("queued"):
+                line.append(f"  · {len(s['queued'])} queued", style="cyan")
+            line.append("  · ctrl-c stops waiting (not the agent)", style=ui.DIM)
+            status.update(line)
+
     try:
-        w = wait_turn(call, ref, max(timeout, 1))
+        w = wait_turn(call, ref, max(timeout, 1), on_poll=show)
     except DaemonError as e:
         fail(str(e), as_json)
     except KeyboardInterrupt:
         raise typer.Exit(130) from None
+    finally:
+        if status is not None:
+            status.stop()
     s, short = w.session, short_id(w.session["id"])
     if as_json:
         print(json.dumps({"outcome": w.outcome, "session_id": s["id"], "status": s["status"],
                           "reply": w.reply, "detail": w.detail}))  # fmt: skip
         raise typer.Exit(EXIT[w.outcome])
     if w.outcome == "done":
-        err.print(Text("ok: ", style="bold green") + Text(f"{short} finished (now {s['status']})"))
+        took = int(time.monotonic() - started)
+        err.print(ui.success(f"{ui.title(s)} finished", f"{short} · {took // 60}:{took % 60:02d}"))
         if w.reply and not quiet:
             if out.is_terminal:
                 from rich.markdown import Markdown
@@ -758,7 +841,7 @@ def _wait(ref: str, timeout: int, quiet: bool, as_json: bool) -> None:
                 print(w.reply)
         return
     if w.outcome == "approval":
-        err.print(approval_panel(s["id"], s.get("pending_approval") or {}, s["controllable"]))
+        err.print(ui.approval_card(s))
     message = {
         "approval": f"{short} is waiting for your approval of {w.detail}",
         "timeout": f"timed out after {timeout}s; {short} is still {s['status']}",
@@ -766,18 +849,8 @@ def _wait(ref: str, timeout: int, quiet: bool, as_json: bool) -> None:
         "uncertain": f"{short}: delivery uncertain; check `agentctl tail {short}` before resending",
         "undelivered": f"{short} has undelivered work: {w.detail}",
     }[w.outcome]
-    err.print(Text("error: ", style="bold red") + Text(message))
+    err.print(ui.failure(message))
     raise typer.Exit(EXIT[w.outcome])
-
-
-OptIdArg = Annotated[
-    str | None,
-    typer.Argument(
-        help="Session id prefix, name or folder; @ for the one waiting on you.",
-        autocompletion=complete_session,
-        show_default=False,
-    ),
-]
 
 
 @app.command()
@@ -797,15 +870,48 @@ def approve(
 ) -> None:
     """Answer a pending permission prompt (default: option 1, Yes).
 
-    `--all --tool PATTERN` answers every matching request at once, after showing you the list
-    (skip that with -y). There's no blanket approve: say `--tool '*'` if you mean it."""
+    With no session on a terminal: pick one of those waiting (or take the only one), see what
+    it wants, and choose the answer. `--all --tool PATTERN` answers every matching request at
+    once, after showing you the list (skip that with -y). There's no blanket approve: say
+    `--tool '*'` if you mean it."""
     if all_ or tool:
         _answer_all(True, tool, here, yes, as_json)
+        return
+    if id is None and choice is None and not as_json and _interactive():
+        _approve_interactively()
         return
     if id is None:
         fail("which session? an id, name or folder, or @ for the one waiting on you", as_json)
     r = rpc("approve", as_json, id=id, choice=choice, allow=True)
-    ok(f"{short_id(r['session_id'])} → {r['chosen']}", as_json, r)
+    ok(f"answered {short_id(r['session_id'])}: {r['chosen']}", as_json, r)
+
+
+def _approve_interactively() -> None:
+    pending = [
+        r for r in rpc("ls", False)
+        if r["status"] == "awaiting_approval" and r.get("pending_approval")
+    ]  # fmt: skip
+    if not pending:
+        out.print(ui.success("Nothing is waiting for approval."))
+        return
+    sid = pending[0]["id"] if len(pending) == 1 else choose_session("approve:", pending)
+    if sid is None:
+        raise typer.Exit(1)
+    r = next(x for x in pending if x["id"] == sid)
+    err.print(ui.approval_card(r, show_hint=False))
+    appr = r["pending_approval"]
+    if appr.get("questions"):
+        fail("it's asking questions: answer them in agentctl watch (a)", False)
+    if not r.get("controllable"):
+        fail("read-only here", False, [ui.hint(f"agentctl adopt {short_id(sid)}")])
+    options = appr.get("options") or {"1": "Yes", "2": "No"}
+    key = ui.pick_option(options, err)
+    if key is None:
+        raise typer.Exit(1)
+    no = options[key].lower().startswith(("no", "reject", "deny"))
+    choice = int(key) if key.isdigit() else None
+    res = rpc("approve", False, id=sid, choice=choice, allow=not no)
+    ok(f"answered {short_id(sid)}: {res['chosen']}", False, res, ui.title(r))
 
 
 def _answer_all(allow: bool, tool: str | None, here: bool, yes: bool, as_json: bool) -> None:
@@ -830,7 +936,7 @@ def _answer_all(allow: bool, tool: str | None, here: bool, yes: bool, as_json: b
         )
         for m in todo:
             out.print(
-                Text(f"  {short_id(m['session_id'])} ", style="bold")
+                Text().append(f"  {short_id(m['session_id'])} ", style="bold")
                 + Text(m["tool"])
                 + Text(f"  {short_cwd(m['cwd'])}", style="blue")
             )
@@ -862,34 +968,39 @@ def deny(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="With --all: don't ask first.")] = False,
     as_json: JsonOpt = False,
 ) -> None:
-    """Reject a pending permission prompt (`--all --tool PATTERN` for several)."""
+    """Reject a pending permission prompt.
+
+    `--all --tool PATTERN` for several. With no session on a terminal, pick one of those
+    waiting."""
     if all_ or tool:
         _answer_all(False, tool, here, yes, as_json)
         return
-    if id is None:
-        fail("which session? an id, name or folder, or @ for the one waiting on you", as_json)
-    r = rpc("approve", as_json, id=id, allow=False)
-    ok(f"{short_id(r['session_id'])} → {r['chosen']}", as_json, r)
+    waiting = lambda r: r["status"] == "awaiting_approval"  # noqa: E731
+    r = rpc("approve", as_json, id=pick_or_fail(id, as_json, "deny:", waiting), allow=False)
+    ok(f"denied {short_id(r['session_id'])}: {r['chosen']}", as_json, r)
 
 
 @app.command()
-def interrupt(id: IdArg, as_json: JsonOpt = False) -> None:
-    """Stop the current turn (sends Escape)."""
-    r = rpc("interrupt", as_json, id=id)
+def interrupt(id: OptIdArg = None, as_json: JsonOpt = False) -> None:
+    """Stop the current turn (sends Escape). With no session on a terminal, pick one."""
+    busy = lambda r: r["status"] in ("working", "awaiting_approval") and r["controllable"]  # noqa: E731
+    r = rpc("interrupt", as_json, id=pick_or_fail(id, as_json, "interrupt:", busy))
     ok(f"interrupted {short_id(r['session_id'])}", as_json, r)
 
 
 @app.command()
 def attach(
     id: Annotated[
-        str,
+        str | None,
         typer.Argument(
-            help="Session id prefix, name or folder, or a tmux pane id like %2.",
+            help="Session id prefix, name or folder, or a tmux pane id like %2; none: pick one.",
             autocompletion=complete_session,
+            show_default=False,
         ),
-    ],
+    ] = None,
 ) -> None:
     """Jump to the session's tmux pane (ctrl-] d detaches from agentctl's panes)."""
+    id = pick_or_fail(id, False, "attach:", lambda r: bool(r.get("tmux_pane")))
     if id.startswith("%"):  # a pane `new`/`adopt` opened, before its session exists
         _attach(launcher.socket_path(), id)
         return
@@ -947,24 +1058,23 @@ def _launched(r: dict[str, Any], state: str, as_json: bool) -> None:
         print(json.dumps(r | {"state": state}))
         return
     ref = short_id(r["session_id"])
-    body = Text()
-    body.append("id      ", style="dim").append(ref, style="bold")
-    answer = f"Answer it in `agentctl watch` (v shows its screen), or: agentctl attach {ref}"
-    if state == "pending":
-        body.append("\n\nSend its first message with:\n")
-        body.append(f'agentctl send {ref} "…"', style="bold")
-    elif state == "update":
-        body.append("\n\nCodex is offering an update; pick Skip or update.\n", style="yellow")
-        body.append(answer, style="bold")
-    elif state == "trust":
-        body.append("\n\nThe agent is asking whether to trust this folder.\n", style="yellow")
-        body.append(answer, style="bold")
-    elif state == "unknown":
-        body.append("\n\nNot up yet; check with: ", style="yellow")
-        body.append(f"agentctl attach {ref}", style="bold")
-    else:
-        body.append("\nstatus  ", style="dim").append_text(status_text(state))
-    out.print(Panel(body, title=" ok: launched ", title_align="left", border_style="green"))
+    head = f"Started {ref}" + (f" in {ui.tilde(r['cwd'])}" if r.get("cwd") else "")
+    if state in ui.STATUS:
+        out.print(ui.success(head) + Text("  ") + ui.status_label(state))
+        out.print(ui.hint(f"agentctl attach {ref}", f"agentctl tail {ref} -f", "agentctl watch"))
+        return
+    out.print(ui.success(head))
+    say = {
+        "pending": ("It's waiting for its first message.", f'agentctl send {ref} "…"'),
+        "update": ("Codex is offering an update: pick Skip or update.", f"agentctl attach {ref}"),
+        "trust": ("It's asking whether to trust this folder.", f"agentctl attach {ref}"),
+        "unknown": ("It isn't up yet.", f"agentctl attach {ref}"),
+    }
+    line, command = say.get(state, say["unknown"])
+    style = ui.DIM if state == "pending" else "yellow"
+    for ln in ui.tree([Text(line, style=style)]):
+        out.print(ln)
+    out.print(ui.hint(command, "agentctl watch"))
 
 
 @app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -1196,12 +1306,19 @@ def queue(
     if as_json:
         print(json.dumps({"session_id": s["id"], "queued": s["queued"]}))
         return
+    ref = short_id(s["id"])
     if not s["queued"]:
-        out.print(Text("nothing queued", style="dim"))
+        out.print(ui.success(f"Nothing queued for {ui.title(s)}"))
+        return
+    n = len(s["queued"])
+    out.print(Text(f"{n} queued for {ui.title(s)}", style="bold")
+              + Text().append("  sent one at a time, once it's free", style=ui.DIM))  # fmt: skip
     for i, t in enumerate(s["queued"], 1):
-        out.print(Text(f"{i}. ", style="bold").append(t))
+        out.print(Text().append(f"  {i:>2}  ", style=ui.DIM).append(ui.first_line(t, 90)))
     if s.get("queue_error"):
-        out.print(Text(f"can't send yet: {s['queue_error']}", style="red"))
+        out.print(ui.failure(f"can't send yet: {s['queue_error']}"))
+    out.print()
+    out.print(ui.hint(f"agentctl queue {ref} --clear", f'agentctl send {ref} -l "…"'))
 
 
 @app.command()
@@ -1215,25 +1332,42 @@ def digest(as_json: JsonOpt = False) -> None:
         print(json.dumps(rows, indent=2))
         return
     if not rows:
-        out.print(Text("nothing new since you last looked", style="dim"))
+        out.print(ui.success("Nothing new since you last looked."))
+        return
+    known = {x["id"]: x for x in rpc("ls", False, all=True)}
+    total = sum(r["new_replies"] for r in rows)
+    out.print(
+        Text().append(f"{total} new repl{'ies' if total != 1 else 'y'}", style="bold cyan")
+        + Text(f" in {len(rows)} session{'s' if len(rows) != 1 else ''}", style=ui.DIM)
+    )
     for r in rows:
-        head = Text(f"{short_id(r['id'])} ", style="bold")
-        head.append_text(status_text(r["status"])).append(f"  {r['title'] or ''}")
-        body = Text(f"{r['new_replies']} new repl{'ies' if r['new_replies'] > 1 else 'y'}")
-        if r["files"]:
-            body.append(" · touched " + ", ".join(r["files"][:6]), style="blue")
-            body.append(f" +{len(r['files']) - 6}" if len(r["files"]) > 6 else "")
+        k = known.get(r["id"], {})
+        head = Text("\n") + ui.glyph(r["status"]) + Text(" ")
+        head.append(ui.project(k) if k else "", style=f"bold {ui.ACCENT}")
+        head.append(f"  {r['title'] or ''}", style="bold").append(
+            f"  {r['new_replies']} new  {short_id(r['id'])}", style=ui.DIM
+        )
+        out.print(head)
+        lines: list[Text] = []
+        if r["last_reply"]:
+            lines.append(Text().append("◆ ", style="green") + Text(r["last_reply"]))
+        for e in r.get("errors") or []:
+            lines.append(Text().append("✗ ", style="red") + Text(e, style="red"))
         if r.get("failed_tools"):
             n = r["failed_tools"]
-            body.append(f" · {n} failed tool call{'s' if n > 1 else ''}", style="red")
+            lines.append(Text(f"{n} tool call{'s' if n > 1 else ''} failed", style="red"))
         if r.get("stuck_minutes") is not None:
-            body.append(f" · no output for {r['stuck_minutes']}m", style="bold yellow")
-        for e in r.get("errors") or []:
-            body.append("\n✗ ", style="red").append(e, style="red")
-        if r["last_reply"]:
-            body.append("\n◆ ", style="green").append(r["last_reply"], style="dim")
-        out.print(head)
-        out.print(body, "")
+            lines.append(Text(f"no output for {r['stuck_minutes']}m", style="yellow"))
+        if r["files"]:
+            more = f"  +{len(r['files']) - 6}" if len(r["files"]) > 6 else ""
+            lines.append(
+                Text().append("edited ", style=ui.DIM) + Text(", ".join(r["files"][:6]) + more)
+            )
+        for ln in ui.tree(lines):
+            out.print(ln)
+    first = short_id(rows[0]["id"])
+    out.print()
+    out.print(ui.hint(f"agentctl tail {first}", "agentctl watch"))
 
 
 def reset_time(ts: float) -> str:
@@ -1268,18 +1402,32 @@ def usage(as_json: JsonOpt = False) -> None:
     if as_json:
         print(json.dumps(u, indent=2))
         return
-    for key, name in (("claude", "Claude Code"), ("codex", "Codex")):
+    width = 24 if out.width >= 70 else 12
+    for i, (key, name) in enumerate((("claude", "Claude Code"), ("codex", "Codex"))):
         lim = u.get(key)
+        if i:
+            out.print()
         if not lim:
             how = "a Claude session's status line redraws" if key == "claude" else "Codex replies"
-            out.print(Text(f"{name}: nothing reported yet (it updates when {how})", style="dim"))
+            out.print(
+                Text().append(name, style="bold")
+                + Text(f"  nothing yet · updates when {how}", ui.DIM)
+            )
             continue
-        plan = f" ({lim['plan']})" if lim.get("plan") else ""
-        out.print(Text(f"{name}{plan}", style="bold"))
+        head = Text(name, style="bold")
+        if lim.get("plan"):
+            head.append(f"  {lim['plan']}", style=ui.DIM)
+        head.append(f"  as of {age(lim['at'])} ago", style=ui.DIM)
+        out.print(head)
         for w in lim["windows"]:
-            when = datetime.fromtimestamp(w["resets_at"]).strftime("%a %H:%M")
-            out.print(f"  {w['name']:<5} {round(w['used_percent']):>3}% used · resets {when}")
-        out.print(Text(f"  as of {age(lim['at'])} ago", style="dim"))
+            pct = round(w["used_percent"])
+            line = Text(f"  {w['name']:<7}") + ui.gauge(pct, width)
+            colour = "red" if pct >= 85 else "yellow" if pct >= 60 else ""
+            line.append(f" {pct:>3}%", style=f"bold {colour}".strip())
+            when = reset_time(w["resets_at"])
+            line.append(f"  resets in {ui.until(w['resets_at'])}", style=ui.DIM)
+            line.append(f" ({when})", style=ui.DIM)
+            out.print(line)
 
 
 @app.command()
@@ -1295,14 +1443,15 @@ def rename(
 
 @app.command()
 def close(
-    id: IdArg,
+    id: OptIdArg = None,
     force: Annotated[bool, typer.Option(help="Even mid-turn (aborts it).")] = False,
     as_json: JsonOpt = False,
 ) -> None:
     """Quit a session's agent and close agentctl's pane for it.
 
     Like Ctrl-C in its terminal. The session stays resumable (`agentctl adopt <id>`)."""
-    r = rpc("close", as_json, id=id, force=force)
+    live = lambda r: r["status"] != "ended" and r["controllable"]  # noqa: E731
+    r = rpc("close", as_json, id=pick_or_fail(id, as_json, "close:", live), force=force)
     ok(f"closed {short_id(r['session_id'])}", as_json, r)
 
 
@@ -1729,9 +1878,21 @@ def _print_rules(rules: list[str]) -> None:
         out.print(Text("no approval rules: every prompt waits for you", style="dim"))
         out.print(Text(RULES_HELP, style="dim"))
         return
+    out.print(
+        Text().append(f"{len(rules)} approval rule{'s' if len(rules) != 1 else ''}", style="bold")
+        + Text("  · deny rules win · each answer is noted in the transcript", ui.DIM)
+    )
     for i, r in enumerate(rules, 1):
-        style = "red" if r.startswith("deny") else "green"
-        out.print(Text(f"{i:>3}  ", style="bold") + Text(r, style=style))
+        action, _, rest = r.partition(" ")
+        pattern, _, folder = rest.partition("  in ")
+        style = "bold red" if action == "deny" else "bold green"
+        line = Text().append(f"  {i:>2}  ", style=ui.DIM) + Text(f"{action:<5}", style=style)
+        line.append(f" {pattern.strip()}")
+        if folder:
+            line.append(f"  in {ui.tilde(folder.strip())}", style=ui.DIM)
+        out.print(line)
+    out.print()
+    out.print(ui.hint('agentctl rules add "allow …"', "agentctl rules rm N", "agentctl rules test"))
 
 
 @rules_app.callback()

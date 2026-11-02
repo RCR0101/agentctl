@@ -207,8 +207,15 @@ def test_ambiguous_name_offers_a_pick_on_a_terminal(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(cli, "call", call)
     monkeypatch.setattr(cli, "_interactive", lambda: True)
-    monkeypatch.setattr(cli.typer, "prompt", lambda *a, **k: "2")
+    offered: list[list[str]] = []
+
+    def choose(prompt: str, rows: list[dict[str, Any]]) -> str:
+        offered.append([r["id"] for r in rows])
+        return "bbbb2222"
+
+    monkeypatch.setattr(cli, "choose_session", choose)
     cli.rpc("send", False, id="api", text="hi")
+    assert offered == [["aaaa1111", "bbbb2222"]]
     assert sent == [{"id": "bbbb2222", "text": "hi"}]
 
 
@@ -219,7 +226,7 @@ def test_ambiguous_name_is_an_error_for_scripts(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(cli, "call", call)
     monkeypatch.setattr(cli, "_interactive", lambda: False)
     r = CliRunner().invoke(cli.app, ["send", "api", "hi"])
-    assert r.exit_code == 1 and "ambiguous" in r.output
+    assert r.exit_code == 1 and "ambiguous" in r.output.lower()
 
 
 def test_completion_offers_ids_names_and_at(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -244,7 +251,7 @@ def test_bare_agentctl_summarises_what_needs_you(monkeypatch: pytest.MonkeyPatch
     r = CliRunner().invoke(cli.app, [])
     assert r.exit_code == 0
     assert "1 need you" in r.output and "1 working" in r.output
-    assert "agentctl approve aaaa1111" in r.output and "wants Bash: ls" in r.output
+    assert "agentctl approve @" in r.output and "wants Bash: ls" in r.output
 
 
 def test_ls_here_keeps_sessions_inside_the_repo(monkeypatch: pytest.MonkeyPatch) -> None:

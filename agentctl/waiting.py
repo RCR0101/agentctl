@@ -57,6 +57,7 @@ def wait_turn(
     timeout: float,
     sleep: Callable[[float], None] | None = None,
     clock: Callable[[], float] | None = None,
+    on_poll: Callable[[dict[str, Any]], None] | None = None,
 ) -> Waited:
     """Block until the session finishes its turn (and its queued follow-ups), stops for
     approval, or the timeout passes. Polls the local daemon only; no model calls."""
@@ -67,6 +68,8 @@ def wait_turn(
     s = call("tail", id=ref, n=0)["session"]
     started = s["status"] == "working"
     while clock() < deadline:
+        if on_poll:
+            on_poll(s)  # e.g. a spinner showing what it's doing
         delivery = s.get("agent_delivery") or {}
         if delivery.get("status") == "unknown":
             return Waited("uncertain", s)
