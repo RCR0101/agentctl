@@ -522,6 +522,16 @@ class ClaudeCodeAdapter:
         ]
         return self.limits | {"windows": windows}
 
+    def hydrate(self, sid: str) -> None:
+        """A session read shallowly at startup (untouched for hours): read its full recent
+        history now that someone is looking at it."""
+        t = self.by_sid.get(sid)
+        if t is None or not t.deepen():
+            return
+        self.reg.events.pop(sid, None)
+        self.ingest(t, publish=False)
+        self.sync(sid)
+
     def holder(self, sid: str) -> int | None:
         """pid of the process that has this session open, if any."""
         info = self.live.get(sid)

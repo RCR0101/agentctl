@@ -175,3 +175,17 @@ def test_cli_approve_all_confirms_before_answering(monkeypatch: pytest.MonkeyPat
     assert r.exit_code == 0 and calls[-1]["only"] == [{"id": "aaaa1111", "tool": "Read: a.py"}]
     r = CliRunner().invoke(cli.app, ["approve", "--all"])
     assert r.exit_code == 1 and "--tool" in r.output  # no blanket approve
+
+
+def test_reading_a_session_loads_its_full_history_but_lookups_dont(tmp_path: Path) -> None:
+    srv, ad = build(tmp_path, ("aaaa1111", "/x", "Read: a", True))
+    seen: list[str] = []
+    ad.hydrate = seen.append  # type: ignore[attr-defined]
+
+    async def run() -> None:
+        await srv.dispatch("tail", {"id": "aaaa1111", "n": 0})  # wait/resolve: no read
+        assert seen == []
+        await srv.dispatch("tail", {"id": "aaaa1111", "n": 50})
+        assert seen == ["aaaa1111"]
+
+    asyncio.run(run())

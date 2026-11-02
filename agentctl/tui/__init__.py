@@ -60,7 +60,7 @@ from agentctl.cli import (
     short_cwd,
     usage_text,
 )
-from agentctl.models import short_id
+from agentctl.ids import short_id
 from agentctl.tui.common import Rpc, nocase, sent_key
 from agentctl.tui.composer import ControlResult, Prompt
 from agentctl.tui.presentation import card_text, group_heading, project_labels, row_text
@@ -724,6 +724,8 @@ class Watch(App[None]):
             self.update_connection()
             self.polled_at = time.monotonic()
             return
+        if not self.is_running:  # quitting while ls was in flight: the widgets are going
+            return
         self.last_success = time.monotonic()
         self.connection_error = ""
         self.update_connection()
@@ -888,6 +890,8 @@ class Watch(App[None]):
         self.rebuild()
 
     def rebuild(self) -> None:
+        if not self.is_running:  # a timer or stream update arriving during shutdown
+            return
         rows = self.filtered()
         overview = Text()
         counts = [
@@ -1000,6 +1004,8 @@ class Watch(App[None]):
         from agentctl.daemon.fleet import project_root
 
         root = await asyncio.to_thread(project_root, r["cwd"]) if r and r["cwd"] else ""
+        if not self.is_running:
+            return
         title = self.query_one("#files-title", Static)
         tree = self.query_one("#files", Files)
         if not root or not os.path.isdir(root):
@@ -1103,6 +1109,8 @@ class Watch(App[None]):
     def tick_running(self) -> None:
         """While it works: what it's running and for how long, so a long command isn't
         mistaken for a stuck screen."""
+        if not self.is_running:  # a timer firing while the app shuts down
+            return
         row, log = self.current(), self.query_one("#log", Transcript)
         line = self.query_one("#running", Static)
         line.display = bool(row and row["status"] == "working" and log.last_ts)

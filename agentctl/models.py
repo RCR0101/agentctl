@@ -3,6 +3,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from agentctl.ids import short_id
+
 Source = Literal["claude_code", "codex", "opencode"]
 Origin = Literal["cli", "desktop", "sdk", "unknown"]
 Status = Literal["working", "awaiting_approval", "awaiting_input", "idle", "ended"]
@@ -54,6 +56,4 @@ class SessionEvent(BaseModel):
     payload: dict[str, Any]
 
 
-def short_id(sid: str) -> str:
-    """8 chars to show and type. opencode ids all start with "ses_", so skip that."""
-    return sid.removeprefix("ses_")[:8]
+__all__ = ["short_id"]  # re-exported: the CLI imports it from agentctl.ids, without pydantic

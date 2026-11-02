@@ -19,13 +19,12 @@ from typing import Annotated, Any, NoReturn
 
 import typer
 from rich.console import Console, Group
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from agentctl import HOME, LOG_DIR, SOCKET_PATH, hooks, launcher
-from agentctl.models import short_id
+from agentctl.ids import short_id
 from agentctl.setup import LABEL, PLIST
 from agentctl.teams_cli import app as teams_app
 from agentctl.waiting import EXIT, context_full, stuck_minutes, wait_turn
@@ -418,6 +417,8 @@ def render(
     if kind == "message" and p["role"] == "user":
         line.append("› ", style="bold cyan").append(p["text"], style="bold")
     elif kind == "message" and markdown:  # agents reply in Markdown: render it
+        from rich.markdown import Markdown  # ~50 ms to import: only when there's a reply
+
         return Group(line.append("◆", style="bold green"), Markdown(p["text"]))
     elif kind == "message":
         line.append("◆ ", style="bold green").append(p["text"])
@@ -750,6 +751,8 @@ def _wait(ref: str, timeout: int, quiet: bool, as_json: bool) -> None:
         err.print(Text("ok: ", style="bold green") + Text(f"{short} finished (now {s['status']})"))
         if w.reply and not quiet:
             if out.is_terminal:
+                from rich.markdown import Markdown
+
                 out.print(Markdown(w.reply))
             else:  # piped: the reply exactly as written, unwrapped
                 print(w.reply)

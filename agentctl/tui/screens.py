@@ -26,7 +26,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from agentctl.cli import age, status_text
-from agentctl.models import short_id
+from agentctl.ids import short_id
 from agentctl.tui.common import Rpc, nocase, sent_key
 
 

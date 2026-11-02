@@ -246,6 +246,8 @@ class Server:
                             self.teams.takeover(session.id)
                 else:
                     self.teams.takeover(self.reg.resolve(p["id"]).id)
+        if method in ("tail", "history", "review") and p.get("id") and int(p.get("n", 1)) > 0:
+            self.hydrate(str(p["id"]))
         if method == "history":
             s = self.reg.resolve(p["id"])
             return self.history.listing(s.id, self.reg.events.get(s.id, ()))
@@ -275,6 +277,17 @@ class Server:
             raise
         self.history.update(entry, outcome="queued" if "queued" in result else "sent")
         return result | {"command_id": entry["id"]}
+
+    def hydrate(self, ref: str) -> None:
+        """Someone is reading this session: load its full recent history if startup only
+        read the end (it had been untouched for hours)."""
+        try:
+            s = self.reg.resolve(ref)
+        except KeyError:
+            return  # the handler reports it
+        hydrate = getattr(self.adapters[s.source], "hydrate", None)
+        if hydrate:
+            hydrate(s.id)
 
     async def agent_request(self, method: str, p: dict[str, Any]) -> dict[str, Any]:
         """Agent messages use fresh chats; continuing one requires positive provenance."""

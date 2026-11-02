@@ -248,3 +248,51 @@ def test_ask_user_question_is_answered_like_a_person_would(
     ]  # fmt: skip
     with pytest.raises(Exception, match="pick one or type"):
         asyncio.run(a.answer(SID, [{"choices": [1, 2]}, {"text": "x"}, {"choices": [1]}]))
+
+
+def test_old_transcripts_start_shallow_and_load_in_full_when_opened(
+    env: tuple[Registry, ClaudeCodeAdapter, Path],
+) -> None:
+    """Startup reads only the end of sessions untouched for hours (fast with a long history);
+    opening one reads its full recent history."""
+    import os
+    import time
+
+    from agentctl import tailer
+
+    reg, a, root = env
+    p = transcript(root)
+    text = "".join(
+        line(type="user", timestamp=f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z",
+             message={"role": "user", "content": f"message {i} " + "x" * 400})
+        for i in range(1200)
+    )  # fmt: skip
+    p.write_text(text)
+    old = time.time() - tailer.SHALLOW_AFTER - 60
+    os.utime(p, (old, old))
+    asyncio.run(a.discover())
+    shallow = len(reg.events[SID])
+    assert reg.sessions[SID].cwd == "/Users/me/proj"  # the head's metadata is still read
+    assert 0 < shallow < 100  # ~32 KB of a ~500 KB transcript
+    last = reg.events[SID][-1].payload["text"]
+    a.hydrate(SID)
+    deep = list(reg.events[SID])
+    assert len(deep) > shallow * 5 and deep[-1].payload["text"] == last  # same end, more of it
+    texts = [e.payload["text"] for e in deep]
+    assert len(texts) == len(set(texts))  # nothing repeated
+    a.hydrate(SID)  # only once
+    assert len(reg.events[SID]) == len(deep)
+
+
+def test_recent_transcripts_still_read_the_full_tail(
+    env: tuple[Registry, ClaudeCodeAdapter, Path],
+) -> None:
+    reg, a, root = env
+    text = "".join(
+        line(type="user", timestamp="2026-01-01T00:00:00Z",
+             message={"role": "user", "content": f"message {i} " + "x" * 400})
+        for i in range(1200)
+    )  # fmt: skip
+    transcript(root).write_text(text)
+    asyncio.run(a.discover())
+    assert len(reg.events[SID]) > 400

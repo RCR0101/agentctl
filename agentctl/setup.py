@@ -11,7 +11,6 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from importlib import metadata
 from pathlib import Path
 
 import agentctl
@@ -49,6 +48,8 @@ def first_line(s: str | None) -> str:
 
 def install_info() -> tuple[str, str | None]:
     """("uv tool" | "uv tool, editable from <dir>" | ".venv in <dir>" | ..., project dir)."""
+    from importlib import metadata  # slow to import; only `doctor` and `setup` need it
+
     src = None
     try:
         direct = json.loads(metadata.distribution("agentctl").read_text("direct_url.json") or "{}")
@@ -177,6 +178,8 @@ def tailscale_ip() -> str | None:
 
 
 def checks() -> list[Check]:
+    from importlib import metadata  # slow to import; only `doctor` and `setup` need it
+
     out: list[Check] = []
     add = out.append
 

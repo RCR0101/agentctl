@@ -570,6 +570,15 @@ class CodexAdapter:
         at, rl = max(newest.values(), key=lambda x: x[0])
         return {"plan": rl.get("plan_type"), "at": at.isoformat(), "windows": windows}
 
+    def hydrate(self, tid: str) -> None:
+        """See ClaudeCodeAdapter.hydrate."""
+        r = self.rollouts.get(tid)
+        if r is None or tid in self.loaded or not r.deepen():
+            return
+        self.reg.events.pop(tid, None)
+        self.ingest(r, publish=False)
+        self.sync(tid)
+
     def holder(self, tid: str) -> int | None:
         return self.holders.get(tid)
 

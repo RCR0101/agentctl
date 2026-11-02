@@ -319,6 +319,9 @@ class OpenCodeAdapter:
         self.ensure(sid)
         self.sync(sid)
 
+    def hydrate(self, sid: str) -> None:
+        """Nothing to do: opencode's history is read from its database as needed."""
+
     def holder(self, sid: str) -> int | None:
         row = self.live.get(sid)  # only known for opencodes agentctl started
         return int(row["pid"]) if row else None
