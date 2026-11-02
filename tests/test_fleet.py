@@ -227,3 +227,68 @@ def test_cancel_one_queued_message() -> None:
         assert (await srv.dispatch("unqueue", {"id": "aaaa1111"}))["queued"] == []
 
     asyncio.run(run())
+
+
+def test_file_diff(tmp_path: Path) -> None:
+    def git(*a: str) -> None:
+        subprocess.run(["git", "-C", str(tmp_path), *a], check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (tmp_path / "a.txt").write_text("one\n")
+    git("add", "a.txt")
+    git("commit", "-qm", "a")
+    assert fleet.file_diff(str(tmp_path / "a.txt")) == "no changes since the last commit"
+    (tmp_path / "a.txt").write_text("two\n")
+    assert "-one\n+two" in fleet.file_diff(str(tmp_path / "a.txt"))
+    (tmp_path / "new.txt").write_text("fresh\n")
+    assert "+fresh" in fleet.file_diff(str(tmp_path / "new.txt"))  # untracked: all added
+
+
+def test_search_index_reads_messages_and_keeps_up(tmp_path: Path) -> None:
+    import json
+
+    from agentctl.daemon.search import Index
+
+    f = tmp_path / "s1.jsonl"
+
+    def line(typ: str, content: Any, ts: str) -> str:
+        return json.dumps(
+            {"type": typ, "timestamp": ts, "message": {"role": typ, "content": content}}
+        )
+
+    f.write_text(
+        line("user", "set up Caddy for the site", "2026-10-15T10:00:00Z") + "\n"
+        + line("user", [{"type": "tool_result", "content": "caddy in tool output"}],
+               "2026-10-15T10:00:01Z") + "\n"
+        + line("assistant", [{"type": "text", "text": "Caddy is configured."}],
+               "2026-10-15T10:00:02Z") + "\n"
+    )  # fmt: skip
+    ix = Index()
+    files = [("s1", "claude_code", f)]
+    hits = ix.search("CADDY", files)
+    assert [h["role"] for h in hits] == ["assistant", "user"]  # newest first, no tool output
+    assert "**Caddy**" not in hits[0]["snippet"] and "Caddy" in hits[0]["snippet"]
+    with f.open("a") as fh:
+        fh.write(line("user", "now nginx", "2026-10-15T10:01:00Z") + "\n")
+    assert len(ix.search("nginx", files)) == 1  # picked up without rereading
+    assert ix.search("  ", files) == []
+    edit = {"type": "tool_use", "id": "t1", "name": "Edit", "input": {"file_path": "src/a.py"}}
+    with f.open("a") as fh:
+        d = json.loads(line("assistant", [edit], "2026-10-15T10:02:00Z"))
+        fh.write(json.dumps(d | {"cwd": "/w/proj"}) + "\n")
+    assert ix.edited("s1", "claude_code", f) == ["/w/proj/src/a.py"]
+
+
+def test_preview_is_the_newest_message_or_tool_call() -> None:
+    evs = [
+        ev("s", "message", 30, role="assistant", text="Done.\n\nAll   tests pass."),
+        ev("s", "tool_result", 20, text="ok"),
+    ]
+    assert fleet.preview(evs) == {
+        "kind": "assistant", "text": "Done. All tests pass.", "ts": evs[0].ts.isoformat()
+    }  # fmt: skip
+    evs.append(ev("s", "tool_call", 10, name="Bash", summary="pytest -q"))
+    assert fleet.preview(evs)["text"] == "Bash pytest -q"  # type: ignore[index]
+    assert fleet.preview([ev("s", "status_change", 5)]) is None

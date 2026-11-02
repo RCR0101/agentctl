@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from collections import deque
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 
@@ -28,17 +29,34 @@ class Registry:
         if publish:
             self.bus.publish(ev)
 
-    def set_status(self, sid: str, status: Status, reason: str | None = None) -> bool:
+    def set_status(
+        self,
+        sid: str,
+        status: Status,
+        reason: str | None = None,
+        evidence: dict[str, Any] | None = None,
+    ) -> bool:
         s = self.sessions.get(sid)
-        if s is None or s.status == status:
+        if s is None:
             return False
+        if reason is not None and (
+            s.status_reason != reason or s.status_evidence != (evidence or {})
+        ):
+            s.status_reason = reason
+            s.status_evidence = deepcopy(evidence or {})
+            s.status_observed_at = datetime.now(UTC)
+        if s.status == status:
+            return False
+        if reason is None:
+            # A status-only writer must not inherit a prior transition's explanation.
+            s.status_reason, s.status_observed_at, s.status_evidence = None, None, {}
         old, s.status = s.status, status
         self.bus.publish(
             SessionEvent(
                 session_id=sid,
                 kind="status_change",
                 ts=datetime.now(UTC),
-                payload={"from": old, "to": status, "reason": reason},
+                payload={"from": old, "to": status, "reason": reason, "evidence": evidence},
             )
         )
         return True
@@ -88,6 +106,13 @@ class Store:
         )
         # small JSON values that must outlive a restart (e.g. the last Claude plan limits)
         self.db.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, session_id TEXT, "
+            "created REAL, data TEXT)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS commands_session ON commands(session_id, created)"
+        )
 
     def load(self) -> dict[str, dict[str, Any]]:
         rows = self.db.execute(f"SELECT session_id, {', '.join(self.COLS)} FROM sessions")
@@ -124,6 +149,18 @@ class Store:
     def get_json(self, key: str) -> Any:
         row = self.db.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def commands(self) -> list[dict[str, Any]]:
+        return [
+            json.loads(r[0]) for r in self.db.execute("SELECT data FROM commands ORDER BY created")
+        ]
+
+    def save_command(self, entry: dict[str, Any]) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO commands VALUES (?, ?, ?, ?)",
+            (entry["id"], entry["session_id"], entry["created"], json.dumps(entry)),
+        )
+        self.db.commit()
 
     def set_json(self, key: str, value: Any) -> None:
         self.db.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)", (key, json.dumps(value)))

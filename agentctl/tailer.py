@@ -24,10 +24,21 @@ class FileTail:
         if st.st_size <= HEAD_BYTES + TAIL_BYTES:
             return []
         with self.path.open("rb") as f:
-            head = f.read(HEAD_BYTES).split(b"\n")[:-1]
-            f.seek(st.st_size - TAIL_BYTES)
-            f.readline()  # skip to a line boundary
-            self.offset = f.tell()
+            # Include the line containing the tail boundary. Skipping forwards can discard
+            # the latest reply entirely when a single JSONL record is larger than the tail.
+            boundary = st.st_size - TAIL_BYTES
+            while boundary > 0:
+                start = max(0, boundary - HEAD_BYTES)
+                f.seek(start)
+                chunk = f.read(boundary - start)
+                newline = chunk.rfind(b"\n")
+                if newline >= 0:
+                    boundary = start + newline + 1
+                    break
+                boundary = start
+            self.offset = boundary
+            f.seek(0)
+            head = f.read(min(HEAD_BYTES, self.offset)).split(b"\n")[:-1]
         return head
 
     def read_lines(self) -> list[bytes]:

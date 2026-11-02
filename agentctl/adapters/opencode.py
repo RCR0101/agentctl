@@ -240,7 +240,7 @@ class OpenCodeAdapter:
             elif not (d.get("time") or {}).get("end"):
                 return  # still streaming
             self.done.add(part_id)
-            self.emit(root, "message", ts, publish, role=role, text=cap(d.get("text") or ""), **sub)
+            self.emit(root, "message", ts, publish, role=role, text=d.get("text") or "", **sub)
         elif typ == "tool":
             st = d.get("state") or {}
             if st.get("status") not in ("completed", "error"):
@@ -338,12 +338,18 @@ class OpenCodeAdapter:
         row = self.live.get(sid)
         status: Status
         if row:
+            reason = "live_plugin_or_terminal_observed"
             status = "awaiting_approval" if row.get("perm") else "working"
             if not row.get("perm") and not row.get("busy"):
                 status = "awaiting_input"
         else:
             last = self.last.get(sid) or {}
             recent = time.time() - s.last_activity.timestamp() < LIVE_GRACE.total_seconds()
+            reason = (
+                "recent_transcript_inference"
+                if recent
+                else "no_recent_live_evidence_inferred_ended"
+            )
             if recent and last and not (last["role"] == "assistant" and last["done"]):
                 status = "working"  # in an opencode agentctl doesn't control
             else:
@@ -352,7 +358,20 @@ class OpenCodeAdapter:
         s.tmux_pane = row.get("pane") if row else None
         if status != "awaiting_approval":
             s.pending_approval = None
-        self.reg.set_status(sid, status)
+        self.reg.set_status(
+            sid,
+            status,
+            reason,
+            {
+                "pid": (row or {}).get("pid"),
+                "pane": s.tmux_pane,
+                "busy": (row or {}).get("busy"),
+                "permission_prompt": bool((row or {}).get("perm")),
+                "last_activity": s.last_activity.isoformat(),
+                "last_message": self.last.get(sid),
+                "process_exit_confirmed": False,
+            },
+        )
 
     # --- control ---
 

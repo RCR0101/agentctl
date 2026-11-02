@@ -3,6 +3,7 @@
 import contextlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -26,12 +27,14 @@ from rich.text import Text
 from agentctl import HOME, LOG_DIR, SOCKET_PATH, hooks, launcher
 from agentctl.models import short_id
 from agentctl.setup import LABEL, PLIST
+from agentctl.teams_cli import app as teams_app
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, rich_markup_mode="rich")
 daemon_app = typer.Typer(no_args_is_help=True, help="Manage the agentctld background daemon.")
 hooks_app = typer.Typer(no_args_is_help=True, help="Manage Claude Code hooks in settings.json.")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(hooks_app, name="hooks")
+app.add_typer(teams_app, name="teams")
 out = Console(highlight=False)
 err = Console(stderr=True, highlight=False)
 
@@ -127,6 +130,10 @@ def _check(reply: dict[str, Any]) -> Any:
 
 
 def call(method: str, autostart: bool = True, **params: Any) -> Any:
+    if os.environ.get("AGENTCTL_CALLER") == "agent":
+        if method in ("send", "queue"):
+            method, params = "agent_message", {"id": params["id"], "text": params["text"]}
+        params = params | {"_actor": "agent"}
     with _connect(autostart) as s:
         s.sendall(json.dumps({"id": 1, "method": method, "params": params}).encode() + b"\n")
         line = s.makefile("rb").readline()
@@ -156,7 +163,7 @@ def fail(msg: str, as_json: bool) -> NoReturn:
     if as_json:
         print(json.dumps({"error": msg}))
     else:
-        err.print(Text("✗ ", style="bold red") + Text(msg))
+        err.print(Text("error: ", style="bold red") + Text(msg))
     raise typer.Exit(1)
 
 
@@ -164,7 +171,7 @@ def ok(msg: str, as_json: bool, result: Any) -> None:
     if as_json:
         print(json.dumps(result))
     else:
-        out.print(Text("✓ ", style="bold green") + Text(msg))
+        out.print(Text("ok: ", style="bold green") + Text(msg))
 
 
 # --- formatting ---
@@ -180,6 +187,13 @@ def age(iso: str) -> str:
 
 def short_cwd(cwd: str) -> str:
     return "~" if cwd == str(HOME) else Path(cwd).name or cwd
+
+
+def project_display(s: dict[str, Any]) -> str:
+    """A readable project label that distinguishes repositories with the same folder name."""
+    project = str(s.get("project") or short_cwd(s["cwd"]))
+    parent = Path(str(s.get("project_path") or s["cwd"])).parent.name
+    return f"{project} · {parent}" if parent and parent != project else project
 
 
 def tokens(n: int) -> str:
@@ -244,6 +258,17 @@ def approval_panel(
 def session_notes(s: dict[str, Any]) -> list[Text]:
     """Lines about the session beyond its status: overlapping agents, queued follow-ups."""
     notes = [Text(f"! {c}", style="yellow") for c in s.get("conflicts") or []]
+    if s.get("status_reason"):
+        notes.append(
+            Text(
+                f"Lifecycle: {s['status_reason']} · observed {s.get('status_observed_at')}",
+                style="dim",
+            )
+        )
+    else:
+        notes.append(Text("Lifecycle evidence: unknown (no observation recorded)", style="dim"))
+    if not s.get("controllable") and s.get("control_reason"):
+        notes.append(Text(s["control_reason"], style="dim"))
     if s.get("queued"):
         n = len(s["queued"])
         t = Text(f"{n} follow-up{'s' if n > 1 else ''} queued for when it's free", style="cyan")
@@ -261,7 +286,7 @@ def compact_header(s: dict[str, Any]) -> Group:
     meta.append(f" {agent_label(s)} {short_id(s['id'])} ", style="dim")
     if s.get("context_tokens") is not None:
         meta.append_text(ctx_text(s, short=True)).append(" ")
-    meta.append(short_cwd(s["cwd"]), style="blue")
+    meta.append(project_display(s), style="bold cyan")
     return Group(title, meta, *session_notes(s))
 
 
@@ -290,7 +315,13 @@ def session_header(s: dict[str, Any], compact: bool = False) -> Panel | Group:
         else:
             usage.append(" · cache expiry not exposed", style="dim")
     return Panel(
-        Group(meta, *([usage] if usage.plain else []), path, *session_notes(s)),
+        Group(
+            meta,
+            *([usage] if usage.plain else []),
+            Text(f"project · {project_display(s)}", style="bold cyan"),
+            path,
+            *session_notes(s),
+        ),
         title=Text(f" {s['title'] or short_id(s['id'])} ", style="bold"),
         title_align="left",
         subtitle=Text(f" {s['id']} ", style="dim"),
@@ -334,7 +365,9 @@ def render(
     elif kind == "approval_request":
         line.append(f"approval asked: {p.get('tool') or '?'}", style="yellow")
     elif kind == "error":
-        line.append(f"✗ {p.get('text', '')}", style="red")
+        line.append(f"error: {p.get('text', '')}", style="red")
+    elif kind == "notice":
+        line.append(f"note: {p.get('text', '')}", style="cyan")
     else:
         line.append(f"{kind} {json.dumps(p)[:200]}", style="dim")
     return line
@@ -590,7 +623,7 @@ def _launched(r: dict[str, Any], state: str, as_json: bool) -> None:
         body.append(f"agentctl attach {ref}", style="bold")
     else:
         body.append("\nstatus  ", style="dim").append_text(status_text(state))
-    out.print(Panel(body, title=" ✓ launched ", title_align="left", border_style="green"))
+    out.print(Panel(body, title=" ok: launched ", title_align="left", border_style="green"))
 
 
 @app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -656,11 +689,12 @@ def opencode(ctx: typer.Context) -> None:
 TTY_RESET = "\x1b[<u\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h"
 
 
-def _proc(pid: int) -> tuple[str, str]:
-    """(tty, command name) of a process; ("", "") if it's gone."""
+def _proc(pid: int) -> tuple[str, str, str]:
+    """(tty, command name, the macOS app it ships in) of a process; blanks if it's gone."""
     r = subprocess.run(["ps", "-o", "tty=,comm=", "-p", str(pid)], capture_output=True, text=True)
     tty, _, comm = r.stdout.strip().partition(" ")
-    return tty, Path(comm.strip()).name
+    app = re.search(r"/([^/]+)\.app/", comm)  # the outermost bundle: ChatGPT, not CodexCLI
+    return tty, Path(comm.strip()).name, app[1] if app else ""
 
 
 def _alive(pid: int) -> bool:
@@ -698,7 +732,12 @@ class AdoptPlan:
 def check_holder(s: dict[str, Any], pid: int, force: bool) -> tuple[str, str]:
     """(tty, command) of the process holding a session, if agentctl may stop it."""
     short = short_id(s["id"])
-    tty, comm = _proc(pid)
+    tty, comm, app = _proc(pid)
+    if app and tty in ("", "??"):  # a desktop app keeps running (and its turns) once closed
+        raise AdoptError(
+            f"{short} is open in the {app} app (pid {pid}), which keeps running after its window "
+            f"closes. Quit {app} (⌘Q), after any turn running there finishes, then retry."
+        )
     if comm not in ("claude", "codex") or tty in ("", "??"):
         raise AdoptError(
             f"{short} is open in pid {pid} ({comm or 'gone'}), which isn't running in a terminal "
@@ -844,17 +883,25 @@ def digest(as_json: JsonOpt = False) -> None:
         out.print(body, "")
 
 
-def usage_text(u: dict[str, Any]) -> Text:
-    """'cx 5h 15% · week 30%' for the header and `agentctl usage`."""
+def reset_time(ts: float) -> str:
+    """When a limit window resets: "16:30" within a day, else "Wed 20:30"."""
+    return datetime.fromtimestamp(ts).strftime("%H:%M" if ts - time.time() < 86400 else "%a %H:%M")
+
+
+def usage_text(u: dict[str, Any], resets: bool = False) -> Text:
+    """'cx 5h 15% · week 30%'. With resets, one line per agent and when each window resets:
+    'cx 5h 15% (16:30) · week 30% (Wed 20:30)'."""
     t = Text()
     for key, label in (("claude", "cc"), ("codex", "cx")):
         if not u.get(key):
             continue
-        t.append("  " if t else "").append(f"{label} ", style="dim")
+        t.append(("\n" if resets else "  ") if t else "").append(f"{label} ", style="dim")
         for i, w in enumerate(u[key]["windows"]):
             pct = round(w["used_percent"])
             style = "red" if pct >= 90 else "yellow" if pct >= 70 else ""
             t.append(" · " if i else "").append(f"{w['name']} ").append(f"{pct}%", style=style)
+            if resets and w.get("resets_at", 0) > time.time():
+                t.append(f" ({reset_time(w['resets_at'])})", style="dim")
     return t
 
 
@@ -909,29 +956,52 @@ def mcp(
         bool,
         typer.Option("--allow-write", help="Also let the agent send, queue and start sessions."),
     ] = False,
+    team: Annotated[str | None, typer.Option(help="Expose only this team's scoped tools.")] = None,
+    token_file: Annotated[Path | None, typer.Option(help="Private team credential file.")] = None,
 ) -> None:
     """MCP server (stdio) so an agent can see and coordinate your other agents. Read-only
     unless --allow-write. Never exposes approve/deny/close: those stay yours. Add it with
     e.g. `claude mcp add -s user agentctl -- agentctl mcp`."""
     from agentctl.mcp import serve
 
-    serve(allow_write)
+    if bool(team) != bool(token_file):
+        fail("Use --team and --token-file together", False)
+    token = None
+    if token_file:
+        try:
+            if token_file.stat().st_mode & 0o077:
+                fail("Team credential file must be private (chmod 600)", False)
+            token = token_file.read_text().strip()
+        except OSError as error:
+            fail(str(error), False)
+    serve(allow_write, team_id=team, team_token=token)
 
 
 @app.command()
 def watch(
     notify: Annotated[bool, typer.Option(help="macOS notification + bell on approval.")] = False,
+    theme: Annotated[
+        str | None,
+        typer.Option(
+            help="e.g. textual-light, nord; ansi-dark / ansi-light use your terminal's own "
+            "colors. Remembered, like a pick with T.",
+        ),
+    ] = None,
 ) -> None:
     """Live dashboard. Works down to ~45 columns; `n` toggles notifications, `m` raw text."""
+    from textual.theme import BUILTIN_THEMES
+
+    if theme and theme not in BUILTIN_THEMES:
+        fail(f"no theme {theme!r}; one of: {', '.join(sorted(BUILTIN_THEMES))}", False)
     rpc("ping", False)  # starts the daemon if needed
     from agentctl.tui import Watch
 
-    Watch(notify=notify).run()
+    Watch(notify=notify, theme=theme).run()
 
 
 # --- setup ---
 
-MARK = {"ok": ("✓", "green"), "warn": ("!", "yellow"), "fail": ("✗", "red"), "info": ("·", "dim")}
+MARK = {"ok": ("ok", "green"), "warn": ("!", "yellow"), "fail": ("x", "red"), "info": ("·", "dim")}
 
 
 def show_checks(rows: list[Any]) -> None:
@@ -1007,7 +1077,7 @@ def setup(
     if not shutil.which("tmux"):
         fail("tmux is required: brew install tmux", False)
     found = [n for n in su.AGENTS if su.agent_exe(n)]
-    out.print(Text("✓ tmux, agents: " + (", ".join(found) or "none found"), style="green"))
+    out.print(Text("ok: tmux, agents: " + (", ".join(found) or "none found"), style="green"))
     if not found:
         fail("install claude, codex or opencode first", False)
 
@@ -1015,7 +1085,7 @@ def setup(
     if "claude" not in found:
         out.print(Text("skipped: claude not installed", style="dim"))
     elif not hooks.planned(exe)[1]:
-        out.print(Text("✓ installed", style="green"))
+        out.print(Text("ok: installed", style="green"))
     else:
         out.print(f"Adds or updates 8 hook entries in {hooks.SETTINGS} and wraps your status "
                   "line (backed up first; `agentctl hooks uninstall` restores it). They give "
@@ -1027,7 +1097,7 @@ def setup(
     step(3, "Background daemon (launchd)")
     info = su.ping()
     if info and su.launchd_pid() == info["pid"] and su.plist_python() == sys.executable:
-        out.print(Text(f"✓ running under launchd (pid {info['pid']})", style="green"))
+        out.print(Text(f"ok: running under launchd (pid {info['pid']})", style="green"))
     else:
         out.print("Starts agentctld at login, in your desktop session, so agents it launches "
                   "can use your Claude login even when you're connected over SSH.")  # fmt: skip
@@ -1043,7 +1113,7 @@ def setup(
                        "shell's config yourself", style="dim"))  # fmt: skip
     elif not missing:
         out.print(
-            Text(f"✓ {', '.join(found)} already aliased in {su.tilde(str(rc))}", style="green")
+            Text(f"ok: {', '.join(found)} already aliased in {su.tilde(str(rc))}", style="green")
         )
     else:
         out.print(f"Makes {', '.join(missing)} start inside agentctl, so you can watch and answer "
@@ -1142,7 +1212,7 @@ def hooks_status(as_json: JsonOpt = False) -> None:
         return
     t = Table(box=None, show_header=False)
     for ev, cmd in st.items():
-        t.add_row(Text("✓", style="green") if cmd else Text("✗", style="red"), ev)
+        t.add_row(Text("ok", style="green") if cmd else Text("x", style="red"), ev)
     out.print(t)
     cmds = {c.rsplit(" hook ", 1)[0] for c in st.values() if c}
     for c in cmds:
@@ -1188,6 +1258,39 @@ def daemon_status(as_json: JsonOpt = False) -> None:
     else:
         out.print(Text("○ not running", style="dim"))
     raise typer.Exit(0 if info else 1)
+
+
+def restart_daemon(force: bool = False) -> dict[str, Any]:
+    """Wait for the old listener to leave before starting its replacement."""
+    try:
+        previous = call("ping", autostart=False)
+    except DaemonError:
+        return dict(call("ping"))
+    # Keep the daemon's active-turn safeguard; a refused shutdown must not start a replacement.
+    call("shutdown", autostart=False, force=force)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            current = call("ping", autostart=False)
+        except DaemonError:
+            return dict(call("ping"))
+        if current["pid"] != previous["pid"]:
+            return dict(current)
+        time.sleep(0.1)
+    raise DaemonError("daemon has not stopped yet; check agentctl daemon status")
+
+
+@daemon_app.command("restart")
+def daemon_restart(
+    force: Annotated[bool, typer.Option(help="Restart even if a Codex turn is running.")] = False,
+    as_json: JsonOpt = False,
+) -> None:
+    """Reload daemon code. Refuses while a daemon-owned Codex turn is running."""
+    try:
+        info = restart_daemon(force)
+    except DaemonError as e:
+        fail(str(e), as_json)
+    ok(f"agentctld running with refreshed code (pid {info['pid']})", as_json, info)
 
 
 @daemon_app.command("install")

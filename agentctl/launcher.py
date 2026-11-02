@@ -162,7 +162,7 @@ def launch(
     --resume, which keeps the id), so its pane is known before the first hook fires."""
     if not os.path.isdir(cwd):
         raise LaunchError(f"not a directory: {cwd}")
-    sid, env = None, [f"PATH={path}"]
+    sid, env = None, [f"PATH={path}", "AGENTCTL_CALLER=agent"]
     if agent == "claude":
         sid = resume or str(uuid.uuid4())
         exe = need("claude", "install Claude Code", path)

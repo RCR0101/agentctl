@@ -20,7 +20,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from agentctl import CLAUDE_DIR, tmux
-from agentctl.adapters.base import ControlError
+from agentctl.adapters.base import ControlError, answer_summary, plan_answers
 from agentctl.daemon.registry import Registry, Store
 from agentctl.models import ApprovalRequest, EventKind, Origin, Session, SessionEvent, Status
 from agentctl.tailer import FileTail
@@ -126,7 +126,8 @@ def unwrap_pastes(text: str) -> str:
 def local_command(text: str) -> tuple[str, str] | None:
     """Claude Code records slash commands and `!` shell commands as tagged user text. Returns
     (kind, text) to show instead: ("message", "/login") for the command, ("tool_result", …) for
-    its output ("tool_error" if stderr has text), ("skip", "") for the caveat boilerplate.
+    its output ("tool_error" if stderr has text), ("skip", "") for the caveat boilerplate,
+    ("notice", summary) for a background task finishing.
     None if `text` isn't one of those."""
     if not text.lstrip().startswith("<"):
         return None
@@ -135,6 +136,9 @@ def local_command(text: str) -> tuple[str, str] | None:
         return "skip", ""
     if "command-name" in tags:
         return "message", f"{tags['command-name']} {tags.get('command-args', '')}".strip()
+    if "task-notification" in tags:  # a background task it started finished
+        inner = dict(_TAG.findall(tags["task-notification"]))
+        return "notice", inner.get("summary") or f"background task {inner.get('status')}"
     if "bash-input" in tags:
         return "message", "! " + tags["bash-input"].strip()
     if any(k in tags for k in _OUTPUT):
@@ -173,6 +177,7 @@ class Transcript(FileTail):
     first_prompt: str | None = None
     last_kind: str | None = None
     last_tool: str | None = None
+    questions: list[dict[str, Any]] | None = None  # the latest AskUserQuestion's
     model: str | None = None
     context: int | None = None
     cache_ttl: int | None = None  # seconds, from the latest request that wrote cache
@@ -218,7 +223,9 @@ def parse_entry(d: dict[str, Any], t: Transcript) -> list[SessionEvent]:
     def user_text(text: str) -> None:
         kind, shown = local_command(text) or ("message", text)
         if kind == "message":
-            ev("message", role="user", text=cap(shown))
+            ev("message", role="user", text=shown)
+        elif kind == "notice":
+            ev("notice", text=cap(shown))
         elif kind in ("tool_result", "tool_error"):
             ev("tool_result", tool_use_id=None, text=cap(shown), is_error=kind == "tool_error")
 
@@ -269,11 +276,13 @@ def parse_entry(d: dict[str, Any], t: Transcript) -> list[SessionEvent]:
     for b in content if isinstance(content, list) else []:
         bt = b.get("type")
         if bt == "text" and b.get("text"):
-            ev("message", role="assistant", text=cap(b["text"]))
+            ev("message", role="assistant", text=b["text"])
         elif bt == "tool_use":
             summary = tool_summary(b.get("input"))
             if not agent:
                 t.last_tool = f"{b.get('name')}: {summary}"
+                if b.get("name") == "AskUserQuestion":
+                    t.questions = (b.get("input") or {}).get("questions") or None
             ev("tool_call", id=b.get("id"), name=b.get("name"), summary=summary)
     stop = msg.get("stop_reason")
     if stop == "tool_use":
@@ -562,29 +571,45 @@ class ClaudeCodeAdapter:
         fallback = LAST_KIND_STATUS.get(t.last_kind if t else None, "idle")
         hook_st, hook_ts = row.get("hook_status"), row.get("hook_ts") or 0.0
         if info:  # authoritative: rewritten by the live process on every change
+            reason = "live_process_status_observed"
             raw, why = info.get("status", ""), info.get("waitingFor")
             status = "awaiting_input" if why == "dialog open" else PID_STATUS.get(raw, fallback)
         elif hook_st == "ended" and hook_ts >= mtime - 2:  # SessionEnd, nothing written since
+            reason = "session_end_hook_observed"
             status = "ended"
         elif hook_st and s.origin != "cli" and now - hook_ts < HOOK_LIVE.total_seconds():
             # no PID file (desktop/sdk): trust hooks, unless the transcript is newer (interrupts)
+            reason = "recent_hook_observed" if hook_ts >= mtime else "newer_transcript_inference"
             status = hook_st if hook_st == "ended" or hook_ts >= mtime else fallback
         elif t and now - mtime < LIVE_GRACE.total_seconds():
+            reason = "recent_transcript_inference"
             status = fallback
         else:
+            reason = "no_recent_live_evidence_inferred_ended"
             status = "ended"
         if status == "awaiting_approval":
             hooked = row.get("hook_status") == "awaiting_approval" and hook_ts >= mtime - 5
             tool = row.get("detail") if hooked else (t.last_tool if t else None)
             prev = s.pending_approval
+            asking = bool(t and t.questions and (tool or "").startswith("AskUserQuestion"))
             s.pending_approval = ApprovalRequest(
-                tool=tool or (prev.tool if prev else None),
+                tool="AskUserQuestion" if asking else tool or (prev.tool if prev else None),
                 detail=(info or {}).get("waitingFor"),
                 options=prev.options if prev else {},
+                questions=(t.questions or []) if t and asking else [],
             )
         else:
             s.pending_approval = None
-        if self.reg.set_status(sid, status) and status == "awaiting_approval":
+        evidence = {
+            "pid": (info or {}).get("pid"),
+            "process_status": (info or {}).get("status"),
+            "waiting_for": (info or {}).get("waitingFor"),
+            "hook_status": hook_st,
+            "hook_ts": hook_ts or None,
+            "transcript_mtime": mtime or None,
+            "process_exit_confirmed": False,
+        }
+        if self.reg.set_status(sid, status, reason, evidence) and status == "awaiting_approval":
             with contextlib.suppress(RuntimeError):  # no loop in unit tests
                 asyncio.get_running_loop().create_task(self.announce_approval(sid))
 
@@ -648,6 +673,46 @@ class ClaudeCodeAdapter:
             raise ControlError(f"no option {key}; choices: " + ", ".join(opts))
         await tmux.literal(sock, pane, key)  # a digit selects immediately; no Enter
         return f"{key}. {opts[key]}"
+
+    async def answer(self, session_id: str, answers: list[dict[str, Any]]) -> str:
+        """Fill in an AskUserQuestion form as you would, one question per tab: a digit picks a
+        single choice (and moves on) or ticks one of several; a typed answer goes in the
+        "Type something" row after the options. With several questions, or any multi-choice
+        one, a last tab reviews them: 1 submits. Measured on 2.1.302."""
+        s = self.reg.sessions[session_id]
+        appr = s.pending_approval if s.status == "awaiting_approval" else None
+        qs = appr.questions if appr else []
+        if not qs:
+            raise ControlError("session isn't asking a question")
+        plan = plan_answers(qs, answers)
+        sock, pane = await self.verified(session_id)
+
+        async def press(*k: str, text: str = "") -> None:
+            await (tmux.literal(sock, pane, text) if text else tmux.keys(sock, pane, *k))
+            await asyncio.sleep(0.3)  # each key re-renders the form
+
+        for q, (n, picks, typed) in zip(qs, plan, strict=True):
+            if not q.get("multiSelect"):
+                await press(str(n + 1) if typed else str(picks[0]))
+                if typed:
+                    await press(text=typed)
+                    await press("Enter")
+                continue
+            for c in picks:
+                await press(str(c))  # ticks; the cursor stays on the first row
+            if typed:
+                await press(str(n + 1))
+                for _ in range(n):
+                    await press("Down")
+                await press(text=typed)
+                await press("Tab")  # out of the text, onto the question's Submit row
+            else:
+                for _ in range(n + 1):
+                    await press("Down")
+            await press("Enter")  # next question, or the review tab
+        if len(qs) > 1 or any(q.get("multiSelect") for q in qs):
+            await press("1")  # "Submit answers"
+        return answer_summary(qs, plan)
 
     async def interrupt(self, session_id: str) -> None:
         sock, pane = await self.verified(session_id)

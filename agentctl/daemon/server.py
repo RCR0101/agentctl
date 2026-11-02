@@ -6,6 +6,7 @@ import ctypes
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import time
@@ -13,6 +14,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
 
 from agentctl import LOG_DIR, SOCKET_PATH, STATE_DIR, launcher, tmux
@@ -20,9 +22,12 @@ from agentctl.adapters.base import Adapter, ControlError
 from agentctl.adapters.claude_code import ClaudeCodeAdapter
 from agentctl.adapters.codex import CodexAdapter
 from agentctl.adapters.opencode import OpenCodeAdapter
-from agentctl.daemon import fleet
+from agentctl.daemon import fleet, search
+from agentctl.daemon.agent_chats import AgentChats, identify_agent
 from agentctl.daemon.bus import Bus
+from agentctl.daemon.history import CommandHistory
 from agentctl.daemon.registry import Registry, Store
+from agentctl.daemon.teams import Teams
 from agentctl.models import Session, SessionEvent, short_id
 
 log = logging.getLogger("agentctld")
@@ -35,6 +40,14 @@ def peer_uid(fd: int) -> int:
     if _libc.getpeereid(fd, ctypes.byref(uid), ctypes.byref(gid)) != 0:
         return -1
     return uid.value
+
+
+def peer_pid(fd: int) -> int:
+    # macOS sys/un.h: SOL_LOCAL=0, LOCAL_PEERPID=0x002.
+    pid, length = ctypes.c_int32(), ctypes.c_uint32(ctypes.sizeof(ctypes.c_int32))
+    if _libc.getsockopt(fd, 0, 0x002, ctypes.byref(pid), ctypes.byref(length)) != 0:
+        raise ValueError("Cannot verify the caller of this chat write; no message was sent")
+    return pid.value
 
 
 class RpcError(Exception):
@@ -65,6 +78,9 @@ class Server:
         store: Store | None = None,
     ) -> None:
         self.store = store
+        self.history = CommandHistory(store)
+        self.agent_chats = AgentChats(store)
+        self.teams = Teams(registry, self.history, store)
         self.titles = store.titles() if store else {}
         seen = store.seen() if store else {}
         if "*" not in seen:  # first run with unread tracking: older replies count as seen
@@ -73,10 +89,24 @@ class Server:
                 store.set_seen("*", seen["*"])
         self.seen = {k: datetime.fromtimestamp(v, UTC) for k, v in seen.items()}
         self.queued: dict[str, list[str]] = store.queued() if store else {}
+        self.legacy_queue = {
+            sid
+            for sid, texts in self.queued.items()
+            if any(
+                not any(
+                    e["session_id"] == sid
+                    and e["text"] == text
+                    and e.get("sender") in ("human", "agent")
+                    for e in self.history.entries.values()
+                )
+                for text in texts
+            )
+        }
         # removed from the list by the user (time removed); back once it has newer activity
         self.hidden: dict[str, float] = (store.get_json("hidden") if store else None) or {}
         self.armed: dict[str, bool] = {}  # may the next follow-up go out yet?
         self.queue_error: dict[str, str] = {}
+        self.index = search.Index()
         self.reg = registry
         self.claude = claude
         self.codex = codex
@@ -105,7 +135,50 @@ class Server:
                 try:
                     req = json.loads(line)
                     method, params = req["method"], req.get("params") or {}
+                    if (
+                        method
+                        in (
+                            "send",
+                            "queue",
+                            "launch",
+                            "keys",
+                            "approve",
+                            "answer",
+                            "interrupt",
+                            "close",
+                            "pane",
+                            "team_assign",
+                            "team_assignment_review",
+                            "team_release",
+                        )
+                        or method.startswith("team_")
+                        or method == "teams_list"
+                    ):
+                        holders = {
+                            holder
+                            for s in self.reg.sessions.values()
+                            if (holder := self.adapters[s.source].holder(s.id))
+                        }
+                        if await identify_agent(peer_pid(sock.fileno()), holders):
+                            params = params | {"_actor": "agent"}
+                            if method in ("send", "queue"):
+                                method, params = (
+                                    "agent_message",
+                                    {
+                                        "id": params["id"],
+                                        "text": params["text"],
+                                        "command_id": params.get("command_id"),
+                                        "_actor": "agent",
+                                        **(
+                                            {"team_token": params["team_token"]}
+                                            if "team_token" in params
+                                            else {}
+                                        ),
+                                    },
+                                )
                     if method == "follow":
+                        if params.get("team_token") is not None:
+                            raise RpcError("Scoped credentials cannot follow global sessions")
                         await self.follow(reader, writer, req.get("id"), params)
                         return
                     result = await self.dispatch(method, params)
@@ -128,6 +201,212 @@ class Server:
             writer.close()
 
     async def dispatch(self, method: str, p: dict[str, Any]) -> Any:
+        """Record delivery before doing it, so a lost connection never loses the audit trail."""
+        if p.get("team_token") is not None and not (
+            method.startswith("team_") or method == "teams_list"
+        ):
+            raise RpcError("Scoped team credentials cannot call global session methods")
+        if method in ("agent_message", "agent_launch"):
+            if p.get("team_token") is not None:
+                raise RpcError("Use scoped team assignment tools")
+            return await self.agent_request(method, p)
+        if p.get("_actor") == "agent":
+            if method == "launch":
+                return await self.agent_request("agent_launch", p)
+            allowed = {
+                "ls",
+                "tail",
+                "screen",
+                "history",
+                "digest",
+                "search",
+                "edited",
+                "file_activity",
+                "usage",
+                "ping",
+                "send",
+                "queue",
+                "launch",
+            }
+            if method not in allowed and not p.get("team_token"):
+                raise RpcError("This control is reserved for the human; use scoped team tools")
+            if method in ("send", "queue"):
+                sid = self.reg.resolve(self.aliases.get(p["id"], p["id"])).id
+                self.agent_chats.require(sid)
+        if method.startswith("team_") or method == "teams_list":
+            return self.teams.rpc(method, p, STATE_DIR)
+        if p.get("team_token") is not None:
+            raise RpcError("Scoped team credentials cannot call global session methods")
+        if p.get("id") in self.aliases:
+            p = p | {"id": self.aliases[p["id"]]}
+        if (
+            method in ("send", "queue", "keys", "pane", "interrupt", "close")
+            and not p.get("_team_dispatch")
+            and p.get("_actor") != "agent"
+        ):
+            if p.get("id"):
+                if p["id"].startswith("%"):
+                    for session in self.reg.sessions.values():
+                        if session.tmux_pane == p["id"]:
+                            self.teams.takeover(session.id)
+                else:
+                    self.teams.takeover(self.reg.resolve(p["id"]).id)
+        if method == "history":
+            s = self.reg.resolve(p["id"])
+            return self.history.listing(s.id, self.reg.events.get(s.id, ()))
+        if method == "review":
+            s = self.reg.resolve(p["id"])
+            return await asyncio.to_thread(
+                fleet.review_turn, s, list(self.reg.events.get(s.id, ()))
+            )
+        if method not in ("send", "queue"):
+            return await self._dispatch(method, p)
+        sid = p["id"] if p["id"].startswith("%") else self.reg.resolve(p["id"]).id
+        command_id = p.get("command_id")
+        if command_id and command_id in self.history.entries:
+            previous = self.history.entries[command_id]
+            if previous["session_id"] != sid or previous["text"] != p["text"]:
+                raise RpcError("command id already belongs to a different message")
+            raise RpcError(f"Message already recorded as {previous['outcome']}; check sent history")
+        entry = self.history.begin(sid, p["text"], command_id)
+        self.history.update(entry, sender=p.get("_actor", "human"))
+        try:
+            result = await self._dispatch(method, p)
+        except (RpcError, ControlError, KeyError, ValueError) as e:
+            self.history.update(entry, outcome="failed", error=str(e))
+            raise
+        except Exception as e:
+            self.history.update(entry, outcome="unknown", error=str(e))
+            raise
+        self.history.update(entry, outcome="queued" if "queued" in result else "sent")
+        return result | {"command_id": entry["id"]}
+
+    async def agent_request(self, method: str, p: dict[str, Any]) -> dict[str, Any]:
+        """Agent messages use fresh chats; continuing one requires positive provenance."""
+        if method == "agent_launch":
+            if p.get("resume"):
+                raise RpcError("Agents cannot resume user chats")
+            model = p.get("model") or ""
+            extra = p.get("extra") or []
+            if extra:
+                if len(extra) != 1 or not extra[0].startswith("--model="):
+                    raise RpcError("Agent launches accept a model name, not arbitrary flags")
+                model = extra[0].removeprefix("--model=")
+            if model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,79}", model):
+                raise RpcError("model must be a plain model name")
+            return dict(
+                await self._dispatch(
+                    "launch",
+                    {
+                        "agent": p["agent"],
+                        "cwd": p["cwd"],
+                        "name": p.get("name"),
+                        "extra": [f"--model={model}"] if model else [],
+                        "path": p.get("path") or os.environ.get("PATH", ""),
+                        "reference": p.get("reference"),
+                        "_actor": "agent",
+                    },
+                )
+            ) | {
+                "requested_model": model or None,
+                "model_selection": "requested" if model else "agent_default",
+            }
+        reference = self.reg.resolve(self.aliases.get(p["id"], p["id"]))
+        new_chat = p.get("new_chat", True)
+        if not isinstance(new_chat, bool):
+            raise RpcError("new_chat must be true or false")
+        if not new_chat:
+            self.agent_chats.require(reference.id)
+        model = p.get("model") or ""
+        if model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,79}", model):
+            raise RpcError("model must be a plain model name")
+        if model and not new_chat:
+            raise RpcError("A model can only be requested for a new chat")
+        model_receipt = {
+            "requested_model": model or None,
+            "model_selection": ("requested" if model else "agent_default")
+            if new_chat
+            else "existing_chat",
+        }
+        assignment_id = p.get("_team_assignment")
+        if assignment_id:
+            assignment = self.teams.assignments[assignment_id]
+            team = self.teams.resolve(assignment.team_id)
+            _, member = self.teams.active_member(team, assignment.member_id)
+            if member.session_id != reference.id or assignment.session_id != reference.id:
+                raise RpcError("Assignment no longer matches the connected worker")
+        text = str(p["text"])
+        if not text.strip():
+            raise RpcError("A message cannot be empty")
+        command_id = p.get("command_id")
+        if command_id and command_id in self.history.entries:
+            previous = self.history.entries[command_id]
+            if (
+                previous["text"] != text
+                or previous.get("reference") != reference.id
+                or previous.get("new_chat") != new_chat
+                or previous.get("requested_model") != (model or None)
+            ):
+                raise RpcError("Request id belongs to another agent message")
+            return {
+                "session_id": previous["session_id"],
+                "command_id": command_id,
+                "delivery_status": previous["outcome"],
+                **model_receipt,
+                "new_chat": new_chat,
+            }
+        entry = self.history.begin(reference.id, text, command_id)
+        self.history.update(
+            entry,
+            sender="agent",
+            outcome="creating" if new_chat else "sending",
+            reference=reference.id,
+            new_chat=new_chat,
+            team_assignment=assignment_id,
+            **model_receipt,
+        )
+        try:
+            sid = reference.id
+            if new_chat:
+                agent = {"claude_code": "claude", "codex": "codex", "opencode": "opencode"}
+                launched = await self.agent_request(
+                    "agent_launch",
+                    {
+                        "agent": agent[reference.source],
+                        "cwd": reference.cwd,
+                        "name": "Agent: " + (reference.title or reference.cwd.rsplit("/", 1)[-1]),
+                        "reference": reference.id,
+                        "model": model,
+                    },
+                )
+                sid = launched["session_id"]
+                self.history.update(entry, session_id=sid)
+            # Delivery waits locally for setup and the first safe input prompt. Nothing is
+            # typed into a trust dialog, and the original conversation is never resumed.
+            result = await self._dispatch("queue", {"id": sid, "text": text})
+            self.history.update(entry, outcome="queued")
+            return dict(result) | {
+                "command_id": entry["id"],
+                "delivery_status": "queued",
+                **model_receipt,
+                "new_chat": new_chat,
+            }
+        except Exception as error:
+            self.history.update(entry, outcome="unknown", error=str(error))
+            raise
+
+    async def agent_ready(self, sid: str) -> None:
+        """A placeholder can contain setup UI; its idle status alone proves nothing."""
+        s = self.reg.resolve(sid)
+        captured = await self._dispatch("screen", {"id": sid})
+        text = captured["screen"]
+        if any(marker.lower() in text.lower() for marker in MENU_MARKERS):
+            raise RpcError("New agent chat needs human setup; the message remains queued")
+        prompt = {"codex": "Ask Codex", "opencode": "Ask anything"}.get(s.source)
+        if not prompt or prompt not in text:
+            raise RpcError("Waiting for the new agent chat's input prompt")
+
+    async def _dispatch(self, method: str, p: dict[str, Any]) -> Any:
         if p.get("id") in self.aliases:  # a placeholder id keeps working after it's replaced
             p = p | {"id": self.aliases[p["id"]]}
         if method == "hook":
@@ -138,6 +417,8 @@ class Server:
                 self.claude.on_hook(ev, payload, p.get("pane"), p.get("tmux"))
             return None
         if method == "launch":
+            if p.get("_actor") == "agent" and p.get("resume"):
+                raise RpcError("Agents must start a fresh chat; resuming user chats is prohibited")
             args = (p["agent"], p["cwd"], p.get("name"), p.get("extra") or [])
             path = p.get("path") or os.environ.get("PATH", "")
             r = await asyncio.to_thread(launcher.launch, *args, path, p.get("resume"))
@@ -151,9 +432,13 @@ class Server:
                 self.claude.register_pane(r["session_id"], r["socket"], r["pane"])
                 if r["session_id"] not in self.reg.sessions:
                     # e.g. at "trust this folder?": Claude announces the session only after it
-                    self.add_placeholder(p["agent"], p["cwd"], r["socket"], r["pane"])
+                    r["session_id"] = self.add_placeholder(
+                        p["agent"], p["cwd"], r["socket"], r["pane"]
+                    )
             if not r["session_id"]:
                 r["session_id"] = self.add_placeholder(p["agent"], p["cwd"], r["socket"], r["pane"])
+            if p.get("_actor") == "agent":
+                self.agent_chats.created(r["session_id"], p.get("reference"))
             return r
         if method == "register_pane":
             if p.get("source") == "codex":  # thread id unknown until the TUI opens one
@@ -168,6 +453,8 @@ class Server:
         if method in ("send", "keys", "screen", "pane", "close", "interrupt") and (
             not p["id"].startswith("%") and self.reg.resolve(p["id"]).id in self.pending
         ):
+            if method == "send" and p.get("_actor") == "agent":
+                await self.agent_ready(p["id"])
             return await self.placeholder(method, self.reg.resolve(p["id"]).id, p)
         if method == "keys":
             bad = [k for k in p["keys"] if k not in KEYS]
@@ -214,8 +501,13 @@ class Server:
             if method == "queue":
                 items = [*items, p["text"]]
             elif p.get("index") is not None:  # cancel one
+                index = int(p["index"])
+                if 0 <= index < len(items):
+                    self.history.queued_delivery(s.id, items[index], "cancelled")
                 items = [x for i, x in enumerate(items) if i != int(p["index"])]
             else:
+                for text in items:
+                    self.history.queued_delivery(s.id, text, "cancelled")
                 items = []
             self.set_queued(s.id, items)
             return {"session_id": s.id, "queued": items}
@@ -241,6 +533,21 @@ class Server:
             elif s.source == "codex":
                 await self.codex.scan_locks()
             return {"session_id": s.id, "pid": self.adapters[s.source].holder(s.id)}
+        if method == "search":
+            hits = await asyncio.to_thread(
+                self.index.search, p["q"], self.transcripts(), int(p.get("limit", 50))
+            )
+            for h in hits:
+                known = self.reg.sessions.get(h["id"])
+                h["title"] = self.titles.get(h["id"]) or (known.title if known else None)
+                h["status"] = known.status if known else "ended"
+            return hits
+        if method == "edited":  # files a session edited
+            s = self.reg.resolve(p["id"])
+            for sid, source, path in self.transcripts([s.id]):
+                return await asyncio.to_thread(self.index.edited, sid, source, path)
+            since = datetime.fromtimestamp(0, UTC)  # opencode: no file; the events it sent
+            return sorted(fleet.edited_files(self.reg.events.get(s.id, ()), s.cwd, since))
         if method == "file_activity":
             sessions = [x for x in self.reg.sessions.values() if x.id not in self.pending]
             hours = float(p.get("hours") or 2)
@@ -253,8 +560,8 @@ class Server:
             s = self.reg.resolve(p["id"])
             if s.status in ("working", "awaiting_approval") or self.queued.get(s.id):
                 log.info("send %s: %d chars, %s: queued", short_id(s.id), len(p["text"]), s.status)
-                return await self.dispatch("queue", {"id": s.id, "text": p["text"]})
-        if method in ("send", "approve", "interrupt", "pane"):
+                return await self._dispatch("queue", {"id": s.id, "text": p["text"]})
+        if method in ("send", "approve", "answer", "interrupt", "pane"):
             s = self.reg.resolve(p["id"])
             ad = self.adapters[s.source]
             if method == "send":
@@ -267,13 +574,21 @@ class Server:
             if method == "approve":
                 chosen = await ad.approve(s.id, p.get("choice"), bool(p.get("allow", True)))
                 return {"session_id": s.id, "chosen": chosen}
+            if method == "answer":
+                if not isinstance(ad, (ClaudeCodeAdapter, CodexAdapter)):
+                    raise RpcError(f"answering questions isn't supported for {s.source} yet")
+                return {"session_id": s.id, "chosen": await ad.answer(s.id, p["answers"])}
             if method == "interrupt":
                 await ad.interrupt(s.id)
                 return {"session_id": s.id}
             sock, pane = await ad.verified(s.id)
             return {"session_id": s.id, "socket": sock, "pane": pane}
         if method == "ping":
-            return {"pid": os.getpid(), "started": STARTED}
+            return {
+                "pid": os.getpid(),
+                "started": STARTED,
+                "features": ["review", "history", "teams", "agent-chat-isolation"],
+            }
         if method == "shutdown":
             # Codex turns started via `agentctl send` run in our app-server: stopping kills them.
             busy = [t[:8] for t, v in self.codex.loaded.items() if v.get("turn")]
@@ -312,6 +627,12 @@ class Server:
             }
         raise RpcError(f"unknown method {method!r}")
 
+    def transcripts(self, only: list[str] | None = None) -> list[tuple[str, str, Path]]:
+        """(session id, source, transcript file) for Claude and Codex sessions."""
+        files = [(sid, "claude_code", t.path) for sid, t in self.claude.by_sid.items()]
+        files += [(tid, "codex", r.path) for tid, r in self.codex.rollouts.items()]
+        return [f for f in files if only is None or f[0] in only]
+
     async def refuse_if_menu(self, ad: Adapter, sid: str) -> None:
         """The status can lag the screen by a second; the screen can't. Look before typing."""
         try:
@@ -327,15 +648,50 @@ class Server:
 
     def dump(self, s: Session, conflicts: dict[str, list[str]] | None = None) -> dict[str, Any]:
         d = s.model_dump(mode="json")
+        d["agent_writable"] = s.id in self.agent_chats.records
+        d["initiated_by"] = "agent" if d["agent_writable"] else "user_or_unknown"
+        delivery = next(
+            (
+                e
+                for e in reversed(list(self.history.entries.values()))
+                if e["session_id"] == s.id and e.get("sender") == "agent"
+            ),
+            None,
+        )
+        if delivery:
+            d["agent_delivery"] = {
+                "status": delivery["outcome"],
+                "error": delivery.get("error", ""),
+                "requested_model": delivery.get("requested_model"),
+                "model_selection": delivery.get("model_selection", "agent_default"),
+            }
         if s.id in self.titles:
             d["title"] = self.titles[s.id]
         seen = self.seen.get(s.id, self.seen["*"])
         d["seen_at"] = seen.isoformat()
-        d["unread"] = fleet.unread(self.reg.events.get(s.id, ()), seen)
+        evs = self.reg.events.get(s.id, ())
+        d["unread"] = fleet.unread(evs, seen)
+        d["preview"] = fleet.preview(evs)
         d["project"] = fleet.project_name(s.cwd)
+        d["project_path"] = fleet.project_root(s.cwd)
         d["conflicts"] = (conflicts or {}).get(s.id, [])
         d["queued"] = self.queued.get(s.id, [])
         d["queue_error"] = self.queue_error.get(s.id)
+        live = s.controllable and s.status != "ended"
+        d["capabilities"] = {
+            "send": live,
+            "approve": live and s.status == "awaiting_approval",
+            "interrupt": live and s.status == "working",
+            "attach": bool(s.tmux_pane),
+            "adopt": not s.controllable,
+        }
+        d["control_reason"] = (
+            "Session ended; resume or adopt it to continue"
+            if s.status == "ended"
+            else "Control available"
+            if s.controllable
+            else "Read only; answer in the owning app, or adopt this session to control it"
+        )
         return d
 
     def set_queued(self, sid: str, items: list[str]) -> None:
@@ -343,6 +699,7 @@ class Server:
             self.queued[sid] = items
         else:
             self.queued.pop(sid, None)
+            self.legacy_queue.discard(sid)
             self.queue_error.pop(sid, None)
         if self.store:
             self.store.set_queued(sid, items)
@@ -369,7 +726,14 @@ class Server:
             ):
                 self.armed[e.session_id] = True
         for sid in list(self.queued):
+            if sid in self.legacy_queue:
+                self.queue_error[sid] = (
+                    "Older queued work has no verified sender. "
+                    "Cancel it and resend from the dashboard."
+                )
+                continue
             if sid in self.aliases:  # queued on a placeholder that is now real
+                self.history.migrate(sid, self.aliases[sid])
                 self.set_queued(self.aliases[sid], self.queued[sid])
                 self.set_queued(sid, [])
                 continue
@@ -379,12 +743,67 @@ class Server:
             if not self.armed.get(sid, True):
                 continue
             text = self.queued[sid][0]
+            receipt = next(
+                (
+                    e
+                    for e in self.history.entries.values()
+                    if e["session_id"] == sid
+                    and e["text"] == text
+                    and e["outcome"] in ("queued", "sending", "unknown")
+                ),
+                {},
+            )
+            if not receipt:
+                receipt = next(
+                    (
+                        e
+                        for e in reversed(list(self.history.entries.values()))
+                        if e["session_id"] == sid and e["text"] == text
+                    ),
+                    {},
+                )
+            actor = receipt.get("sender", "human")
+            attempted = False
             try:
-                await self.dispatch("send", {"id": sid, "text": text, "now": True})
-            except (ControlError, RpcError, KeyError) as e:
+                if actor == "agent":
+                    self.agent_chats.require(sid)
+                    if receipt.get("outcome") in ("sending", "unknown"):
+                        raise RpcError("Delivery is uncertain; inspect it before sending again")
+                    if receipt.get("outcome") in ("failed", "cancelled", "sent"):
+                        self.set_queued(sid, self.queued[sid][1:])
+                        continue
+                    assignment_id = receipt.get("team_assignment")
+                    if assignment_id:
+                        assignment = self.teams.assignments[assignment_id]
+                        if assignment.status in ("cancelled", "failed", "accepted"):
+                            self.history.queued_delivery(sid, text, "cancelled")
+                            self.set_queued(sid, self.queued[sid][1:])
+                            continue
+                        if assignment.status == "unknown":
+                            raise RpcError("Unknown assignment delivery requires human inspection")
+                        team = self.teams.resolve(assignment.team_id)
+                        _, member = self.teams.active_member(team, assignment.member_id)
+                        if member.session_id != assignment.session_id:
+                            raise RpcError("Assignment connection changed before delivery")
+                    if sid in self.pending:
+                        await self.agent_ready(sid)
+                    self.history.update(receipt, outcome="sending", error="")
+                    attempted = True
+                await self._dispatch(
+                    "send", {"id": sid, "text": text, "now": True, "_actor": actor}
+                )
+            except Exception as e:
+                if attempted:
+                    self.history.update(receipt, outcome="unknown", error=str(e))
                 self.queue_error[sid] = str(e).strip("'\"")
+                if receipt and not attempted:
+                    self.history.update(receipt, error=self.queue_error[sid])
                 continue
             log.info("sent a queued follow-up to %s", short_id(sid))
+            if actor == "agent":
+                self.history.update(receipt, outcome="sent", error="")
+            else:
+                self.history.queued_delivery(sid, text, "sent")
             self.armed[sid] = False
             self.queue_error.pop(sid, None)
             self.set_queued(sid, self.queued[sid][1:])
@@ -448,6 +867,9 @@ class Server:
             )
             if real:
                 self.aliases[pid] = real
+                self.history.migrate(pid, real)
+                self.agent_chats.migrate(pid, real)
+                self.teams.migrate_session(pid, real)
             if real or await tmux.pane_pid(sock, pane) is None:
                 self.pending.pop(pid, None)
                 self.reg.remove(pid)
@@ -569,6 +991,9 @@ async def main(debug: bool = False) -> None:
     ]
     watchers.append(asyncio.create_task(supervise("placeholders", srv.sweep_placeholders)))
     watchers.append(asyncio.create_task(supervise("queue", srv.deliver_queued)))
+    watchers.append(
+        asyncio.create_task(supervise("teams", lambda: srv.teams.watch(srv.dispatch, srv.queued)))
+    )
     await srv.stopping.wait()
     for w in watchers:
         w.cancel()

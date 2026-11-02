@@ -236,6 +236,10 @@ def test_adopt_never_stops_a_non_terminal_process() -> None:
     with pytest.raises(cli.AdoptError, match="isn't running in a terminal"):
         cli.check_holder(s, 1, force=True)  # launchd: no tty, not an agent
     assert cli._alive(1)
+    with pytest.MonkeyPatch.context() as m:  # Codex inside the ChatGPT app, window closed
+        m.setattr(cli, "_proc", lambda pid: ("??", "codex", "ChatGPT"))
+        with pytest.raises(cli.AdoptError, match=r"Quit ChatGPT \(⌘Q\)"):
+            cli.check_holder(s, 8950, force=True)
 
 
 def test_titles_persist(tmp_path: Path) -> None:

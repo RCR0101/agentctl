@@ -5,32 +5,39 @@ buttons and a footer that only shows the keys that apply, for ~45 columns in Ter
 
 The transcript is one widget per entry, so text can be selected with the mouse (ctrl+c
 copies), replies render as Markdown, and each run of tool calls folds into one line.
-Enter on a live session puts you in the agent itself (its tmux pane; ctrl-] d comes back), so
-typing, pasting, menus and prompts all work as they do there. Sessions without a pane open
-their transcript. `n` starts a session and opens it, `o` adopts, `x` closes."""
+Desktop Enter opens the agent's terminal (ctrl-] d returns); Space opens a fullscreen
+transcript, and Esc returns to the dashboard. Phone Enter opens the fullscreen transcript.
+`n` starts a session, `o` adopts, `x` closes. Local review and delivery history use recorded
+events and Git, without additional model calls."""
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import os
 import shutil
 import subprocess
+import time
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from rich.style import Style
+from rich.table import Table
 from rich.text import Text
 from textual import events, on, work
-from textual.app import App, ComposeResult
-from textual.binding import Binding
+from textual.app import App, ComposeResult, SystemCommand
+from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.message import Message
-from textual.screen import ModalScreen
+from textual.notifications import SeverityLevel
+from textual.screen import ModalScreen, Screen
 from textual.suggester import Suggester
+from textual.theme import BUILTIN_THEMES
 from textual.widgets import (
     Button,
+    Checkbox,
     Collapsible,
     DirectoryTree,
     Footer,
@@ -38,27 +45,98 @@ from textual.widgets import (
     Input,
     Markdown,
     OptionList,
+    RadioButton,
+    RadioSet,
     Static,
     TextArea,
 )
 from textual.widgets.button import ButtonVariant
 from textual.widgets.collapsible import CollapsibleTitle
+from textual.widgets.directory_tree import DirEntry
 from textual.widgets.option_list import Option
+from textual.widgets.tree import TreeNode
 
-from agentctl import HOME, SOCKET_PATH
+from agentctl import HOME, SOCKET_PATH, STATE_DIR
 from agentctl.cli import (
-    STATUS_STYLE,
     age,
-    agent_label,
     cache_text,
     ctx_text,
+    project_display,
     render,
     session_header,
     short_cwd,
     status_text,
     usage_text,
 )
+from agentctl.messages import message_key
 from agentctl.models import short_id
+from agentctl.tui.composer import ControlResult, Prompt
+from agentctl.tui.presentation import card_text, group_heading, row_text
+from agentctl.tui.review import Review
+
+THEME_FILE = STATE_DIR / "theme"  # the last theme picked with T or --theme
+DEFAULT_THEME = "textual-dark"
+
+
+def saved_theme() -> str:
+    with contextlib.suppress(OSError):
+        name = THEME_FILE.read_text().strip()
+        if name in BUILTIN_THEMES:
+            return name
+    return DEFAULT_THEME
+
+
+REPLIES_FILE = STATE_DIR / "replies"  # quick replies under the send box, one per line
+DEFAULT_REPLIES = [
+    "continue",
+    "yes, go ahead",
+    "run the tests and fix what fails",
+    "summarise what you changed",
+]
+LONG_TURN = 120  # seconds: a turn this long gets a "finished" toast
+CACHE_WARN = 120  # seconds of prompt cache left when a waiting Claude session gets a warning
+ARRIVAL_GRACE = 30  # seconds a sent message may stay out of a free agent's transcript
+STALL = 10  # seconds without a finished poll before the watchdog restarts polling
+RPC_TIMEOUT = 30
+
+
+def quick_replies() -> list[str]:
+    with contextlib.suppress(OSError):
+        lines = [ln.strip() for ln in REPLIES_FILE.read_text().splitlines() if ln.strip()]
+        if lines:
+            return lines
+    return DEFAULT_REPLIES
+
+
+def nocase(bindings: list[Binding]) -> list[BindingType]:
+    """Letter keys also work shifted or with caps lock on, and after a phone keyboard
+    capitalises the first letter."""
+    out: list[BindingType] = []
+    for b in bindings:
+        keys = b.key.split(",")
+        upper = [k.upper() for k in keys if len(k) == 1 and k.islower() and k.upper() not in keys]
+        out.append(dataclasses.replace(b, key=",".join(keys + upper)) if upper else b)
+    return out
+
+
+def name_of(r: dict[str, Any]) -> str:
+    return str(r["title"] or short_cwd(r["cwd"]))
+
+
+def sent_key(text: str) -> str:
+    """Match the entire message, allowing terminal whitespace normalization."""
+    return message_key(text)
+
+
+def user_texts(evs: list[dict[str, Any]]) -> set[str]:
+    return {
+        sent_key(str(e["payload"].get("text", "")))
+        for e in evs
+        if e["kind"] == "message"
+        and e["payload"].get("role") == "user"
+        and not e["payload"].get("agent_id")
+    }
+
 
 GROUPS = [
     ("awaiting_approval", "NEEDS APPROVAL"),
@@ -68,12 +146,49 @@ GROUPS = [
     ("ended", "ENDED, last 24h"),
 ]
 NARROW = 80
+# Phone: (label, action) along the bottom of each page, and under its "more" (only what applies)
+TAPBAR = {
+    "list": [("+ new", "new"), ("search", "search"), ("unread", "digest"), ("more", "menu")],
+    "session": [("‹ back", "leave"), ("reply", "send"), ("files", "files"),
+                ("stop", "interrupt"), ("more", "menu")],
+    "files": [("‹ back", "leave")],
+}  # fmt: skip
+TAPBAR_VARIANT: dict[str, ButtonVariant] = {
+    "new": "primary", "send": "primary", "submit": "primary", "review": "warning",
+}  # fmt: skip
+MENU = {
+    "list": [("teams", "teams"), ("search transcripts", "search"),
+             ("commands", "command_palette"),
+             ("group by project / by status", "toggle_projects"),
+             ("show or hide ended (last 24h)", "toggle_ended"), ("filter", "filter"),
+             ("bell + notifications on / off", "toggle_notify"), ("theme", "change_theme"),
+             ("keys", "help"), ("quit", "quit")],
+    "session": [("open its terminal", "attach"), ("review latest turn", "results"),
+                ("commands", "command_palette"), ("queue a message for later", "later"),
+                ("what you sent it", "history"), ("copy the last reply", "copy"),
+                ("rename", "rename"), ("adopt into agentctl", "adopt"),
+                ("hide (keep running)", "hide"), ("quit and hide", "close"),
+                ("raw text / Markdown", "toggle_markdown"),
+                ("keys", "help")],
+    "files": [],
+}  # fmt: skip
 
 Rpc = Callable[..., Awaitable[Any]]
 Follow = Callable[[str], AsyncIterator[dict[str, Any]]]
 
 
 async def rpc(method: str, **params: Any) -> Any:
+    try:
+        async with asyncio.timeout(RPC_TIMEOUT):
+            return await _rpc(method, **params)
+    except TimeoutError:
+        hint = "; check sent history before retrying" if method in ("send", "queue") else ""
+        raise RuntimeError(
+            f"{method}: daemon did not respond within {RPC_TIMEOUT}s{hint}"
+        ) from None
+
+
+async def _rpc(method: str, **params: Any) -> Any:
     reader, writer = await asyncio.open_unix_connection(str(SOCKET_PATH), limit=16 << 20)
     try:
         msg = {"id": 1, "method": method, "params": params}
@@ -104,116 +219,21 @@ async def follow(sid: str) -> AsyncIterator[dict[str, Any]]:
         writer.close()
 
 
-def badges(r: dict[str, Any]) -> Text:
-    """'3 new', overlapping agents, queued follow-ups: the things that ask for a look."""
-    t = Text()
-    if r.get("unread"):
-        t.append(f"{r['unread']} new ", style="bold cyan")
-    if r.get("conflicts"):
-        t.append("! ", style="bold yellow")
-    if r.get("queued"):
-        t.append(f"{len(r['queued'])} queued ", style="cyan")
-    return t
-
-
-def card_text(r: dict[str, Any], folder: bool = True) -> Text:
-    """Phone row: the title gets the whole first line; id, source, age, context, folder below."""
-    approval = r["status"] == "awaiting_approval"
-    t = Text(no_wrap=True, overflow="ellipsis")
-    t.append_text(badges(r))
-    title_style = "bold yellow" if approval else "dim" if r["status"] == "ended" else "bold"
-    t.append(r["title"] or short_cwd(r["cwd"]), style=title_style)
-    t.append(f"\n{short_id(r['id'])} {agent_label(r)} {age(r['last_activity'])} ", style="dim")
-    if r.get("context_tokens") is not None:
-        t.append_text(ctx_text(r, short=True)).append(" ")
-    if cache_text(r, short=True):
-        t.append("cache ", style="dim").append_text(cache_text(r, short=True)).append(" ")
-    if folder:
-        t.append(short_cwd(r["cwd"]), style="blue")
-    else:
-        t.append_text(status_text(r["status"]))
-    return t
-
-
-def row_text(r: dict[str, Any], status: bool = False) -> Text:
-    """Wide row: ls's columns minus the folder (FILES shows it); status only when the
-    list isn't already grouped by it."""
-    approval = r["status"] == "awaiting_approval"
-    t = Text(no_wrap=True, overflow="ellipsis")
-    t.append(short_id(r["id"]), style="bold yellow" if approval else "bold")
-    t.append(f" {agent_label(r):<6} ", style="dim")
-    if status:
-        st = status_text(r["status"])
-        t.append_text(st).append(" " * (8 - len(st)))
-    t.append(f"{age(r['last_activity']):>3} ", style="dim")
-    for cell, width in ((ctx_text(r, short=True), 4), (cache_text(r, short=True), 3)):
-        t.append(" " * (width - len(cell))).append_text(cell).append(" ")
-    t.append_text(badges(r))
-    title_style = "yellow" if approval else "dim" if r["status"] == "ended" else ""
-    t.append(r["title"] or short_cwd(r["cwd"]), style=title_style)
-    return t
-
-
 TOOL_KINDS = ("tool_call", "tool_result", "status_change")
 
 
-class Prompt(TextArea):
-    """Message box. Enter submits; a paste keeps its newlines (Textual's Input keeps only the
-    first line of a paste, which silently cut multi-line messages). New line: shift/alt+enter,
-    ctrl+j, or `\\` then enter (phones have no shift+enter). ↑ on the first line / ↓ on the
-    last recall what you sent this session, like a shell. TextArea brings the rest: ctrl+a/e/
-    w/u/k, undo, selection."""
+class Sessions(OptionList):
+    """Desktop clicks select a preview; Enter opens the agent. Phone taps open its page."""
 
-    sends: list[str] = []  # what was sent to this session, set when the box opens
-    recall = 0  # how far back ↑ has gone; 0 is the draft
-    draft = ""
-
-    BINDINGS = [
-        Binding("shift+enter,alt+enter,ctrl+j", "newline", show=False),
-        Binding("alt+left,alt+b", "cursor_word_left", show=False),
-        Binding("alt+right,alt+f", "cursor_word_right", show=False),
-        Binding("super+left", "cursor_line_start", show=False),
-        Binding("super+right", "cursor_line_end", show=False),
-    ]
-
-    class Submitted(Message):
-        def __init__(self, value: str) -> None:
-            super().__init__()
-            self.value = value
-
-    def action_newline(self) -> None:
-        self.insert("\n")
-
-    def recall_step(self, step: int) -> None:
-        pos = min(max(self.recall + step, 0), len(self.sends))
-        if pos == self.recall:
+    async def _on_click(self, event: events.Click) -> None:
+        event.prevent_default()  # this handler explicitly owns the base class's click behavior
+        if self.app.size.width < NARROW:
+            await super()._on_click(event)
             return
-        if self.recall == 0:
-            self.draft = self.text
-        self.recall = pos
-        self.load_text(self.sends[-pos] if pos else self.draft)
-        self.move_cursor(self.document.end)
-
-    async def _on_key(self, event: events.Key) -> None:
-        row = self.cursor_location[0]
-        if event.key in ("up", "down") and self.sends:
-            if (event.key == "up" and row == 0) or (
-                event.key == "down" and row == self.document.line_count - 1 and self.recall
-            ):
-                event.prevent_default()
-                event.stop()
-                self.recall_step(1 if event.key == "up" else -1)
-                return
-        if event.key == "enter":
-            event.prevent_default()
-            event.stop()
-            row, col = self.cursor_location
-            if col and self.document.get_line(row)[col - 1] == "\\":
-                self.replace("\n", (row, col - 1), (row, col))
-            else:
-                self.post_message(self.Submitted(self.text))
-        else:
-            await super()._on_key(event)
+        event.stop()
+        index = event.style.meta.get("option")
+        if index is not None and not self.get_option_at_index(index).disabled:
+            self.highlighted = index
 
 
 class ToolGroup(Collapsible):
@@ -231,8 +251,121 @@ class Files(DirectoryTree):
 
     HIDE = {"node_modules", "__pycache__", "venv", "target", "dist", "build", "site-packages"}
 
+    edited: frozenset[str] = frozenset()  # files the selected session edited: marked ●
+    edited_dirs: frozenset[str] = frozenset()  # their folders: a dim ●
+
     def filter_paths(self, paths: Iterable[Path]) -> Iterable[Path]:
         return [p for p in paths if not p.name.startswith(".") and p.name not in self.HIDE]
+
+    def set_edited(self, paths: Iterable[str]) -> None:
+        edited = frozenset(paths)
+        if edited != self.edited:
+            self.edited = edited
+            self.edited_dirs = frozenset(str(d) for f in edited for d in Path(f).parents)
+            self._invalidate()  # redraw the labels
+
+    def render_label(self, node: TreeNode[DirEntry], base_style: Style, style: Style) -> Text:
+        label = super().render_label(node, base_style, style)
+        path = str(node.data.path) if node.data else ""
+        if path in self.edited:
+            label.append(" ●", style="bold yellow")
+        elif path in self.edited_dirs:
+            label.append(" ●", style="dim yellow")
+        return label
+
+
+class Diff(ModalScreen[None]):
+    """A file's changes since the last commit."""
+
+    DEFAULT_CSS = """
+    Diff { align: center middle; }
+    Diff > VerticalScroll { width: 95%; height: 90%; border: round $accent; padding: 0 1;
+                            background: $surface; }
+    """
+    BINDINGS = nocase([Binding("escape,q", "dismiss", "close")])
+
+    def __init__(self, path: str, diff: str) -> None:
+        super().__init__()
+        self.path, self.diff = path, diff
+
+    def compose(self) -> ComposeResult:
+        body = Text()
+        for line in self.diff.splitlines():
+            if line.startswith(("diff ", "index ", "--- ", "+++ ", "new file")):
+                style = "bold dim"
+            elif line.startswith("@@"):
+                style = "cyan"
+            elif line.startswith("+"):
+                style = "green"
+            elif line.startswith("-"):
+                style = "red"
+            else:
+                style = ""
+            body.append(line + "\n", style=style)
+        with VerticalScroll():
+            yield Static(Text(tilde(self.path), style="bold"))
+            yield Static(body)
+
+
+class Search(ModalScreen[str | None]):
+    """Search what was said in every session (messages and replies, not tool output); pick a
+    match to open its session."""
+
+    DEFAULT_CSS = """
+    Search { align: center middle; }
+    Search > Vertical { width: 95%; max-width: 110; height: auto; max-height: 90%;
+                        border: round $accent; padding: 0 1; background: $surface; }
+    Search Input { border: none; height: 1; padding: 0; }
+    Search OptionList, Search OptionList:focus { height: auto; max-height: 30; border: none; }
+    """
+    BINDINGS = [Binding("escape", "dismiss(None)", "close")]
+
+    def __init__(self, rpc: "Rpc") -> None:
+        super().__init__()
+        self.rpc = rpc
+        self.hits: list[dict[str, Any]] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Input(placeholder="search every session · enter searches · esc closes")
+            yield Static(id="search-status")
+            yield OptionList(id="hits")
+
+    @on(Input.Submitted)
+    def submitted(self, event: Input.Submitted) -> None:
+        self.run_search(event.value.strip())
+
+    @work(exclusive=True)
+    async def run_search(self, q: str) -> None:
+        status = self.query_one("#search-status", Static)
+        if not q:
+            return
+        status.update(Text("searching…", style="dim"))
+        try:
+            self.hits = await self.rpc("search", q=q)
+        except Exception as e:
+            status.update(Text(str(e), style="red"))
+            return
+        opts = []
+        for i, h in enumerate(self.hits):
+            t = Text(no_wrap=True, overflow="ellipsis")
+            t.append(h["title"] or short_id(h["id"]), style="bold")
+            t.append(f"  {short_id(h['id'])} {age(h['ts'])} ago · ", style="dim")
+            t.append_text(status_text(h["status"]))
+            line = Text("\n" + ("› " if h["role"] == "user" else "  ") + h["snippet"])
+            line.highlight_words([q], style="reverse", case_sensitive=False)
+            opts.append(Option(t + line, id=str(i)))
+        self.query_one("#hits", OptionList).set_options(opts)
+        n = len(self.hits)
+        status.update(Text(f"{n} match{'es' if n != 1 else ''}, newest first", style="dim"))
+        if opts:
+            hits = self.query_one("#hits", OptionList)
+            hits.highlighted = 0  # enter opens the newest match
+            hits.focus()
+
+    @on(OptionList.OptionSelected)
+    def chosen(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(self.hits[int(event.option.id or 0)]["id"])
 
 
 class Transcript(VerticalScroll):
@@ -341,50 +474,70 @@ def fmt_ts(iso: str, narrow: bool) -> str:
     return datetime.fromisoformat(iso).astimezone().strftime("%H:%M" if narrow else "%H:%M:%S")
 
 
-HELP = """\
-[b]list[/b]
-  enter / tap   open a session: jump into it (ctrl-] d comes back)
-  space         its transcript, without jumping in
-  a  d  1-4     approve, deny, pick an option
-  n             new session
-  u             what's new since you last looked
-  p             group by project / by status
-  /             filter by id, title or folder
-  e             show or hide ended sessions
-  q             quit
+HELP = [
+    ("list", [
+        ("enter", "desktop: fullscreen agent terminal; phone: fullscreen transcript"),
+        ("space", "fullscreen transcript; Esc returns to the dashboard"),
+        ("ctrl+t", "open its terminal at any width (ctrl-] d comes back)"),
+        ("g", "go to a session that needs approval"),
+        ("a  d  1-4", "approve, deny, pick an option; a also answers an agent's questions"),
+        ("n", "new session"),
+        ("u", "what's new since you last looked"),
+        ("p", "group by project / by status"),
+        ("/", "filter by id, title or folder"),
+        ("f", "search what was said in every session"),
+        ("e", "show or hide ended (last 24h); search older history"),
+        ("q", "quit"),
+    ]),
+    ("session", [
+        ("s", "send a message (quick replies: one per line in ~/.agentctl/replies)"),
+        ("l", "queue a message for when it's free"),
+        ("h", "what you sent from here, and whether it arrived (↑ ↓ in the box)"),
+        ("w", "review the latest turn and shared project changes"),
+        ("v", "show or hide project files"),
+        ("i", "interrupt the running turn"),
+        ("c", "copy the last reply"),
+        ("r", "rename"),
+        ("o", "adopt: move it into agentctl"),
+        ("x  z", "remove from the list (nothing is deleted) / bring it back"),
+        ("m", "replies as raw text / Markdown"),
+        ("enter", "on a file: its diff (● marks what this session edited)"),
+        ("esc", "back"),
+    ]),
+    ("anywhere", [
+        ("b", "bell + Mac notification: approvals, long turns done, caches expiring"),
+        ("t", "theme (ansi-dark / ansi-light use your terminal's own colors)"),
+        ("ctrl-r", "reload everything (it also reconnects by itself)"),
+        ("ctrl+p", "search all available commands"),
+        ("ctrl-] w", "this dashboard, from inside any agent"),
+    ]),
+]  # fmt: skip
 
-[b]session[/b]
-  s             send a message
-  l             queue a message for when it's free
-  h             what you sent it from here, and whether each arrived
-                (in the send box: ↑ / ↓ recall them)
-  i             interrupt the running turn
-  c             copy the last reply
-  r             rename (agentctl's own name for it)
-  o             adopt: move it into agentctl
-  x             remove from the list (quits it first if it runs in
-                agentctl; nothing is deleted, it can be resumed)
-  z             bring back the session x just removed
-  m             replies as raw text / Markdown
-  ctrl-r        reload everything (it also reconnects by itself)
-  esc           back
 
-  b             bell on new approvals
-  ctrl-] w      this dashboard, from inside any agent
-"""
+def help_table() -> Table:
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="bold", no_wrap=True)
+    t.add_column()
+    for i, (title, rows) in enumerate(HELP):
+        t.add_row(Text(title.upper(), style="dim"))
+        for key, what in rows:
+            t.add_row(key, what)
+        if i < len(HELP) - 1:
+            t.add_row("", "")
+    return t
 
 
 class Help(ModalScreen[None]):
     DEFAULT_CSS = """
     Help { align: center middle; }
-    Help > VerticalScroll { width: auto; max-width: 95%; height: auto; max-height: 95%;
+    Help > VerticalScroll { width: 95%; max-width: 92; height: auto; max-height: 95%;
                             border: round $accent; padding: 0 1; background: $surface; }
     """
-    BINDINGS = [Binding("escape,q,question_mark", "dismiss", "close")]
+    BINDINGS = nocase([Binding("escape,q,question_mark", "dismiss", "close")])
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Static(HELP)
+            yield Static(help_table())
 
     def on_click(self) -> None:
         self.dismiss()
@@ -400,7 +553,7 @@ class History(ModalScreen[str | None]):
                          border: round $accent; padding: 0 1; background: $surface; }
     History OptionList, History OptionList:focus { height: auto; max-height: 30; border: none; }
     """
-    BINDINGS = [Binding("escape,h", "dismiss(None)", "close")]
+    BINDINGS = nocase([Binding("escape,h", "dismiss(None)", "close")])
 
     def __init__(self, title: str, sends: list[dict[str, Any]], arrived: set[str]) -> None:
         super().__init__()
@@ -413,8 +566,12 @@ class History(ModalScreen[str | None]):
             t.append(s["at"] + " ", style="dim")
             if s["outcome"] == "failed":
                 t.append("failed ", style="bold red")
-            elif s["text"].strip() in self.arrived:
+            elif s.get("settled") == "arrived" or (
+                "id" not in s and sent_key(s["text"]) in self.arrived
+            ):
                 t.append("arrived ", style="green")
+            elif s["outcome"] in ("cancelled", "unknown", "sending"):
+                t.append(s["outcome"] + " ", style="yellow")
             else:
                 t.append(f"{s['outcome']}, not in transcript yet ", style="yellow")
             t.append(first_line(s["text"]))
@@ -422,11 +579,11 @@ class History(ModalScreen[str | None]):
                 t.append(f"\n  {s['error']}", style="red")
             opts.append(Option(t, id=str(len(self.sends) - 1 - i)))
         with Vertical():
-            yield Static(Text(f"Sent to {self.head} from here", style="bold"))
+            yield Static(Text(f"Sent to {self.head}", style="bold"))
             if opts:
                 yield OptionList(*opts)
             else:
-                yield Static(Text("nothing sent from this dashboard yet", style="dim"))
+                yield Static(Text("No messages sent through agentctl yet", style="dim"))
 
     @on(OptionList.OptionSelected)
     def chosen(self, event: OptionList.OptionSelected) -> None:
@@ -442,7 +599,7 @@ class Digest(ModalScreen[str | None]):
                         border: round $accent; padding: 0 1; background: $surface; }
     Digest OptionList, Digest OptionList:focus { height: auto; max-height: 30; border: none; }
     """
-    BINDINGS = [Binding("escape,u", "dismiss(None)", "close")]
+    BINDINGS = nocase([Binding("escape,u", "dismiss(None)", "close")])
 
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         super().__init__()
@@ -474,6 +631,108 @@ class Digest(ModalScreen[str | None]):
         self.dismiss(event.option.id)
 
 
+class Menu(ModalScreen[str | None]):
+    """The phone's "more": the rest of what applies here, as rows to tap; returns the action."""
+
+    DEFAULT_CSS = """
+    Menu { align: center bottom; }
+    Menu > OptionList { width: 100%; height: auto; max-height: 80%; border: round $accent;
+                        background: $surface; }
+    """
+    BINDINGS = nocase([Binding("escape,q", "dismiss(None)", "close")])
+
+    def __init__(self, items: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self.items = items
+
+    def compose(self) -> ComposeResult:
+        yield OptionList(*[Option(label, id=action) for label, action in self.items])
+
+    @on(OptionList.OptionSelected)
+    def chosen(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id)
+
+    def on_click(self, event: events.Click) -> None:
+        if event.widget is self:  # a tap outside the rows
+            self.dismiss(None)
+
+
+class Questions(ModalScreen[list[dict[str, Any]] | None]):
+    """An agent's AskUserQuestion as a form: each question's options (pick one, or tick
+    several) and a box for your own answer, which replaces a single choice."""
+
+    DEFAULT_CSS = """
+    Questions { align: center middle; }
+    Questions > Vertical { width: 95%; max-width: 90; height: auto; max-height: 95%;
+                           border: round $accent; background: $surface; padding: 0 1; }
+    Questions VerticalScroll { height: auto; max-height: 1fr; }
+    Questions VerticalScroll > Vertical { height: auto; }
+    Questions .question { margin-top: 1; }
+    Questions RadioSet { border: none; width: 100%; }
+    Questions Checkbox { border: none; width: 100%; }
+    Questions #q-buttons { height: 3; margin-top: 1; }
+    Questions #q-buttons Button { width: 1fr; }
+    """
+    BINDINGS = [Binding("escape", "dismiss(None)", "cancel")]  # letters go into the boxes
+
+    def __init__(self, questions: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.questions = questions
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            with VerticalScroll():
+                for i, q in enumerate(self.questions):
+                    head = Text(f"{q.get('header') or ''}  ", style="dim")
+                    head.append(str(q.get("question") or ""), style="bold")
+                    if q.get("multiSelect"):
+                        head.append("  (any)", style="dim")
+                    yield Static(head, classes="question")
+                    labels = [option_label(o) for o in q.get("options") or []]
+                    if q.get("multiSelect"):
+                        with Vertical(id=f"q{i}"):
+                            yield from (Checkbox(label) for label in labels)
+                    elif labels:
+                        yield RadioSet(*(RadioButton(label) for label in labels), id=f"q{i}")
+                    typing = Input(placeholder="or type your own answer", id=f"t{i}")
+                    if not labels:
+                        typing.placeholder = "your answer"
+                    typing.display = q.get("isOther") is not False
+                    yield typing
+            with Horizontal(id="q-buttons"):
+                yield Button("send answers", variant="primary", id="q-send")
+                yield Button("cancel", id="q-cancel")
+
+    @on(Button.Pressed, "#q-cancel")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#q-send")
+    def send(self) -> None:
+        answers = []
+        for i, q in enumerate(self.questions):
+            typed = self.query_one(f"#t{i}", Input).value.strip()
+            if q.get("multiSelect"):
+                boxes = self.query(f"#q{i} Checkbox").results(Checkbox)
+                picks = [k + 1 for k, box in enumerate(boxes) if box.value]
+            else:
+                sets = self.query(f"#q{i}").results(RadioSet)
+                pressed = next((rs.pressed_index for rs in sets), -1)
+                picks = [] if typed or pressed < 0 else [pressed + 1]
+            if not picks and not typed:
+                self.notify(f"no answer yet: {q.get('question')}", severity="warning")
+                return
+            answers.append({"choices": picks, "text": typed})
+        self.dismiss(answers)
+
+
+def option_label(o: dict[str, Any]) -> Text:
+    label = Text(str(o.get("label") or ""))
+    if o.get("description") and o["description"] != o.get("label"):
+        label.append(f"  {o['description']}", style="dim")
+    return label
+
+
 class Confirm(ModalScreen[bool]):
     """Yes/no dialog with big tap targets."""
 
@@ -484,7 +743,9 @@ class Confirm(ModalScreen[bool]):
     Confirm Horizontal { height: auto; margin-top: 1; }
     Confirm Button { width: 1fr; min-width: 0; }
     """
-    BINDINGS = [Binding("escape", "dismiss(False)", "cancel"), Binding("y", "dismiss(True)")]
+    BINDINGS = nocase(
+        [Binding("escape", "dismiss(False)", "cancel"), Binding("y", "dismiss(True)")]
+    )
 
     def __init__(self, question: str, yes: str = "Yes") -> None:
         super().__init__()
@@ -628,18 +889,38 @@ def tilde(p: str) -> str:
 class Watch(App[None]):
     TITLE = "agentctl"
     CSS = """
+    CommandPalette SearchIcon { display: none; }
     #main { height: 1fr; }
-    #left { width: 45%; min-width: 36; }
-    #list { border: none; padding: 0; text-wrap: nowrap; text-overflow: ellipsis; }
-    #list { height: auto; max-height: 65%; }
-    #files-title { color: $text-muted; text-style: bold; padding: 0 1; border-top: solid $panel;
+    #overview { height: auto; padding: 0 1; background: $panel; }
+    #connection { height: 1; padding: 0 1; color: $text-muted; }
+    #connection.degraded { color: $warning; }
+    #left { width: 35%; min-width: 32; border-right: solid $panel; }
+    #list { border: none; padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
+    #list { height: 1fr; max-height: 100%; }
+    #empty { display: none; height: auto; padding: 1; color: $text-muted; }
+    #empty.show { display: block; }
+    .show-files #list { height: 50%; }
+    #usage { display: none; }
+    #usage.has-usage { display: block; }
+    #usage { height: auto; padding: 0 1; border-top: solid $panel; text-wrap: nowrap;
+             text-overflow: ellipsis; }
+    #files-title { display: none; color: $text-muted; text-style: bold; padding: 0 1;
+                   border-top: solid $panel;
                    text-wrap: nowrap; text-overflow: ellipsis; }
     #files { height: 1fr; padding: 0; }
     #detail { width: 1fr; }
+    .detail-view #left { display: none; }
+    .detail-view #detail { display: block; }
     #header { height: auto; }
     #log { height: 1fr; }
     #prompt { display: none; height: auto; max-height: 8; }
     #prompt.show { display: block; }
+    #composer-title { display: none; height: auto; padding: 0 1; background: $panel; }
+    #composer-title.show { display: block; }
+    #replies { display: none; height: 1; }
+    #replies.show { display: block; }
+    #replies Button { width: 1fr; min-width: 0; height: 1; border: none; margin: 0 1 0 0;
+                      text-wrap: nowrap; text-overflow: ellipsis; }
     #running { height: 1; color: $warning; display: none; text-wrap: nowrap;
                text-overflow: ellipsis; }
     #queued { height: auto; display: none; }
@@ -648,40 +929,75 @@ class Watch(App[None]):
     #actions { height: auto; display: none; }
     #actions.show { display: block; }
     #actions Button { width: 1fr; height: 1; min-width: 0; border: none; margin: 0 0 0 0; }
-    .narrow #left { width: 1fr; min-width: 0; }
+    #actions Static { max-height: 3; padding: 0 1; }
+    #tapbar { display: none; height: 3; }
+    .composing #tapbar { display: block; }
+    #tapbar Button { width: 1fr; min-width: 0; height: 3; margin: 0; }
+    #files { display: none; }
+    .show-files #files-title, .show-files #files.has-root { display: block; }
+    .narrow #left { width: 1fr; min-width: 0; border: none; }
     .narrow #detail { display: none; }
     .narrow.detail-view #left { display: none; }
     .narrow.detail-view #detail { display: block; }
+    /* phone: one full-height page at a time, a bar of large tap targets at the bottom */
+    .narrow #list { height: 1fr; max-height: 100%; padding: 0; }
+    .narrow #usage { dock: top; border-top: none; border-bottom: solid $panel; }
+    .narrow #files-title, .narrow #files.has-root { display: none; }
+    .narrow Footer { display: none; }
+    FooterKey .footer-key--key { padding: 0 0 0 2; }
+    FooterKey .footer-key--description { padding: 0 0 0 1; }
+    .narrow #tapbar { display: block; }
+    .narrow #replies { layout: vertical; height: auto; }
+    .narrow #replies Button { width: 100%; margin: 0 0 1 0; background: $panel;
+                              text-align: left; content-align: left middle; }
+    .narrow #actions Button { height: auto; min-height: 3; text-wrap: wrap; }
+    .narrow.files-view #left { display: block; }
+    .narrow.files-view #detail, .narrow.files-view #list, .narrow.files-view #usage.has-usage {
+        display: none;
+    }
+    .narrow.files-view #files-title, .narrow.files-view #files.has-root { display: block; }
     """
-    BINDINGS = [
-        Binding("j", "down", "down", show=False),
-        Binding("k", "up", "up", show=False),
-        Binding("enter", "open", "open"),
-        Binding("space", "log", "log"),
-        Binding("escape", "leave", "back"),
-        Binding("a", "approve", "yes"),
-        Binding("d", "deny", "no"),
-        Binding("s", "send", "send"),
-        Binding("i", "interrupt", "stop"),
-        Binding("o", "adopt", "adopt"),
-        Binding("n", "new", "new"),
-        Binding("/", "filter", "find"),
-        Binding("x", "close", "remove"),
-        Binding("z", "undo_remove", "undo", show=False),
-        Binding("e", "toggle_ended", "ended", show=False),
-        Binding("b", "toggle_notify", "bell", show=False),
-        Binding("c", "copy", "copy", show=False),
-        Binding("l", "later", "later", show=False),
-        Binding("u", "digest", "new", show=False),
-        Binding("p", "toggle_projects", "projects", show=False),
-        Binding("r", "rename", "rename", show=False),
-        Binding("question_mark", "help", "keys"),
-        Binding("m", "toggle_markdown", "markdown", show=False),
-        Binding("ctrl+r", "refresh", "refresh", show=False),
-        Binding("h", "history", "history", show=False),
-        Binding("q", "quit", "quit"),
-        *[Binding(str(n), f"choose({n})", show=False) for n in range(1, 5)],
-    ]
+    BINDINGS = nocase(
+        [
+            Binding("j", "down", "down", show=False),
+            Binding("k", "up", "up", show=False),
+            Binding("enter", "open", "open"),
+            Binding("space", "log", "fullscreen"),
+            Binding("ctrl+t", "attach", "terminal", show=False),
+            Binding("g", "review", "review", show=False),
+            Binding("w", "results", "review turn", show=False),
+            Binding("v", "files", "files", show=False),
+            Binding("escape", "leave", "back"),
+            Binding("a", "approve", "approve"),
+            Binding("d", "deny", "deny"),
+            Binding("s", "send", "reply"),
+            Binding("ctrl+enter,ctrl+s", "submit", show=False),
+            Binding("i", "interrupt", "stop"),
+            Binding("o", "adopt", "adopt"),
+            Binding("n", "new", "new"),
+            Binding("/", "filter", "find"),
+            Binding("x", "hide", "hide"),
+            Binding("ctrl+x", "close", "quit and hide", show=False),
+            Binding("z", "undo_remove", "undo", show=False),
+            Binding("e", "toggle_ended", "ended", show=False),
+            Binding("b", "toggle_notify", "bell", show=False),
+            Binding("c", "copy", "copy", show=False),
+            Binding("l", "later", "later", show=False),
+            Binding("u", "digest", "unread"),
+            Binding("p", "toggle_projects", "projects", show=False),
+            Binding("r", "rename", "rename", show=False),
+            Binding("question_mark", "help", "keys"),
+            Binding("m", "toggle_markdown", "markdown", show=False),
+            Binding("ctrl+r", "refresh", "refresh", show=False),
+            Binding("h", "history", "history", show=False),
+            Binding("t", "change_theme", "theme", show=False),
+            Binding("f", "search", "search", show=False),
+            Binding("g", "teams", "teams", show=False),
+            Binding("q", "quit", "quit"),
+            Binding("ctrl+q", "quit_app", show=False, priority=True),
+            *[Binding(str(n), f"choose({n})", show=False) for n in range(1, 5)],
+        ]
+    )
 
     def __init__(
         self,
@@ -689,12 +1005,16 @@ class Watch(App[None]):
         rpc: Rpc = rpc,
         follow: Follow = follow,
         agents: list[str] | None = None,
+        theme: str | None = None,
+        start_teams: bool = False,
     ) -> None:
         super().__init__()
+        self.saved_theme = saved_theme()
+        self.theme = theme or self.saved_theme
         self.agents = agents  # installed agents, found on first `n`
+        self.start_teams = start_teams
         self.removed: str | None = None  # last session `x` removed, for `z`
-        self.by_project = False  # `p`: group the list by project instead of status
-        self.usage = ""
+        self.by_project = True  # `p`: switch between project and status grouping
         self.conflicts: set[tuple[str, str]] | None = None
         self.selected_pane: str | None = None  # follows a placeholder to its real session
         self.rpc, self.follow_fn = rpc, follow
@@ -704,23 +1024,46 @@ class Watch(App[None]):
         self.filter = ""
         self.prompt_mode: str | None = None
         self.prompt_target: str | None = None  # the session the box was opened for
-        # what this dashboard sent, per session, until it quits: {at, text, outcome, error}
-        self.sent: dict[str, list[dict[str, str]]] = {}
+        self.prompt_return_focus = "list"
+        self.prompt_token = 0
+        self.submitting = False
+        self.drafts: dict[tuple[str, str], str] = {}
+        self.composer_shown = ""
+        self.files_return_fullscreen = False
+        self.files_return_focus = "list"
+        # Durable daemon receipts, plus connection failures that never reached the daemon.
+        self.sent: dict[str, list[dict[str, Any]]] = {}
+        self.last_success: float | None = None
+        self.connection_error = ""
+        self.stream_state = ""
+        self.connection_shown: tuple[str, bool] | None = None
+        self.overview_shown = ""
+        self.empty_shown = ""
         self.approvals: set[str] | None = None  # None until the first poll
         self.shape: list[tuple[Any, ...]] = []
         self.show_ended = False
         self.markdown = True  # render replies as Markdown; `m` shows the raw text
-        self.choices: dict[str, str] | None = None  # options the approval buttons show
-        self.last_outcome, self.last_error = "", ""  # of the last control() call
-        self.queued_shown: list[str] | None = None
+        self.actions_shown: tuple[Any, ...] | None = None  # tool, options and control availability
+        self.queued_shown: Any | None = None
         self.header_shown: tuple[str, bool, str] | None = None
+        self.working_since: dict[str, float] = {}  # when each running turn was first seen
+        self.cache_warned: set[tuple[str, str]] = set()  # (session, cache expiry) warned about
+        self.opened: str | None = None  # opened from search: listed even if old and ended
+        self.polls = 0
+        self.polled_at = time.monotonic()  # when a poll last finished; see watchdog
+        self.watched_at = time.monotonic()
         self.keys_shown: list[bool | None] = []
+        self.tapbar_shown: list[tuple[str, str]] = []
 
     def compose(self) -> ComposeResult:
         yield Header(icon="◆")
+        yield Static(id="overview")
+        yield Static(id="connection")
         with Horizontal(id="main"):
             with Vertical(id="left"):
-                yield OptionList(id="list")
+                yield Static(id="empty")
+                yield Sessions(id="list")
+                yield Static(id="usage")
                 yield Static(id="files-title")
                 yield Files(HOME, id="files")
             with Vertical(id="detail"):
@@ -729,25 +1072,64 @@ class Watch(App[None]):
                 yield Static(id="running")
                 yield Vertical(id="queued")
                 yield Vertical(id="actions")
+        yield Static(id="composer-title")
         yield Prompt(id="prompt", soft_wrap=True, show_line_numbers=False)
-        yield Footer(compact=True, show_command_palette=False)
+        yield Horizontal(id="replies")
+        yield Horizontal(id="tapbar")
+        yield Footer(show_command_palette=True)
+
+    def get_system_commands(self, screen: Screen[Any]) -> Iterable[SystemCommand]:
+        yield from super().get_system_commands(screen)
+        commands = [
+            ("Teams", "Connect a coordinator to worker sessions and review assignments", "teams"),
+            ("Review approvals", "Go to the next session needing a decision", "review"),
+            ("Unread replies", "See what changed since you last looked", "digest"),
+            ("Review latest turn", "Request, full reply, tool outcomes and Git changes", "results"),
+            ("Reply to session", "Send a message to the selected session", "send"),
+            ("Project files", "Show or hide the project's file browser", "files"),
+            ("Open terminal", "Attach to the selected agent's terminal", "attach"),
+            (
+                "Fullscreen transcript",
+                "Read the session across the whole screen; Esc returns",
+                "log",
+            ),
+            ("Sent history", "Review delivery states or reuse a message", "history"),
+            ("New session", "Choose an agent and project folder", "new"),
+            ("Search transcripts", "Search messages across sessions", "search"),
+            ("Group sessions", "Switch between project and status groups", "toggle_projects"),
+            ("Show ended sessions", "Toggle ended sessions in the list", "toggle_ended"),
+            ("Queue follow-up", "Send a message once the agent is free", "later"),
+            ("Adopt session", "Move this session into agentctl", "adopt"),
+            ("Refresh", "Reconnect and reload session data", "refresh"),
+        ]
+        for title, help_text, action in commands:
+            if self.check_action(action, ()):
+
+                async def invoke(action: str = action) -> None:
+                    await self.run_action(action)
+
+                yield SystemCommand(title, help_text, invoke)
 
     async def on_mount(self) -> None:
         self.update_subtitle()
         await self.poll()
-        self.set_interval(1.0, self.poll)
+        self.poll_timer = self.set_interval(1.0, self.poll)
         await self.poll_usage()
         self.set_interval(30.0, self.poll_usage)
         self.set_interval(1.0, self.tick_running)
+        self.set_interval(1.0, self.watchdog)
         self.query_one("#list", OptionList).focus()
+        if self.start_teams:
+            self.action_teams()
 
     @property
     def narrow(self) -> bool:
         return self.size.width < NARROW
 
     def on_resize(self) -> None:
-        if self.screen.has_class("narrow") != self.narrow:
-            self.screen.set_class(self.narrow, "narrow")
+        dashboard = self.screen_stack[0]
+        if dashboard.has_class("narrow") != self.narrow:
+            dashboard.set_class(self.narrow, "narrow")
             self.shape = []  # cards vs one-line rows
             self.rebuild()
             self.restream()  # timestamp format
@@ -755,19 +1137,36 @@ class Watch(App[None]):
     def current(self) -> dict[str, Any] | None:
         return next((r for r in self.rows if r["id"] == self.selected), None)
 
+    def watch_theme(self, theme: str) -> None:
+        if theme != self.saved_theme:  # a pick (T, --theme), not the start-up default
+            self.saved_theme = theme
+            with contextlib.suppress(OSError):
+                THEME_FILE.write_text(theme + "\n")
+
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Footer shows only what applies to the current view and session (and fits a phone)."""
+        if self.screen.has_class("teams-dialog") and action != "quit_app":
+            return False
         r = self.current()
+        if action == "quit_app":
+            return True
+        if self.prompt_mode:
+            # Editor text must not become session commands if focus briefly leaves the box.
+            if action not in ("leave", "submit"):
+                return False
+            return not self.submitting
         detail = not self.narrow or self.screen.has_class("detail-view")
         live = bool(r and r["controllable"] and r["status"] != "ended")
         if action in ("approve", "deny", "choose"):
-            return bool(r and r["status"] == "awaiting_approval")
-        if action == "open":  # in the transcript, only jumping in is left to do
-            return r is not None and (not (self.narrow and detail) or bool(r["tmux_pane"]))
+            return bool(r and r["controllable"] and r["status"] == "awaiting_approval")
+        if action == "open":
+            return r is not None and self.focused is self.query_one("#list")
         if action == "log":
-            return r is not None and self.narrow and not detail
+            return r is not None
         if action == "leave":
-            return bool(self.prompt_mode) or (self.narrow and detail)
+            return bool(self.filter) or any(
+                self.screen.has_class(c) for c in ("detail-view", "files-view", "show-files")
+            )
         if action in ("filter", "toggle_ended"):
             return not detail or not self.narrow
         if action == "send":
@@ -776,6 +1175,8 @@ class Watch(App[None]):
             return live and bool(r and r["status"] == "working")
         if action == "adopt":
             return detail and bool(r and not r["controllable"])
+        if action == "hide":
+            return r is not None
         if action == "close":  # quitting an agent mid-turn would abort the turn
             busy = ("working", "awaiting_approval")
             return r is not None and not (r["tmux_pane"] and r["status"] in busy)
@@ -787,10 +1188,14 @@ class Watch(App[None]):
             return not detail or not self.narrow
         if action in ("copy", "rename"):
             return detail and r is not None
-        if action == "help":
-            return not detail or not self.narrow
-        if action == "quit":  # a phone footer has room for one row: q is in `?` there
-            return not self.narrow
+        if action == "answer":
+            return bool(self.questions())
+        if action in ("files", "results"):
+            return r is not None and (detail or not self.narrow)
+        if action == "review":
+            return any(x["status"] == "awaiting_approval" for x in self.rows)
+        if action == "attach":
+            return bool(r and r["tmux_pane"])
         if action == "undo_remove":
             return self.removed is not None
         return True
@@ -804,9 +1209,24 @@ class Watch(App[None]):
         bits = [
             f"filter: {self.filter}" if self.filter else "",
             "bell on" if self.notify_on else "",
-            self.usage,
         ]
         self.sub_title = " · ".join(b for b in [extra, *bits] if b)
+
+    def update_connection(self) -> None:
+        elapsed = time.monotonic() - self.last_success if self.last_success is not None else None
+        degraded = bool(self.connection_error) or elapsed is None or elapsed > STALL
+        if degraded:
+            age_text = f" · last update {int(elapsed)}s ago" if elapsed is not None else ""
+            text = f"Reconnecting{age_text} · {self.connection_error or 'waiting for daemon'}"
+        else:
+            text = "Live · " + (self.stream_state or "select a session to read its transcript")
+        degraded = degraded or "reconnecting" in self.stream_state.lower()
+        if (text, degraded) == self.connection_shown:
+            return
+        self.connection_shown = (text, degraded)
+        box = self.query_one("#connection", Static)
+        box.update(Text(text), layout=False)
+        box.set_class(degraded, "degraded")
 
     # --- data ---
 
@@ -815,34 +1235,136 @@ class Watch(App[None]):
             rows = await self.rpc("ls")
         except Exception as e:  # daemon restarting etc.: keep the last view
             self.update_subtitle(f"daemon: {e}")
+            self.connection_error = str(e)
+            self.update_connection()
+            self.polled_at = time.monotonic()
             return
+        self.last_success = time.monotonic()
+        self.connection_error = ""
+        self.update_connection()
         self.update_subtitle()
+        if self.opened and all(r["id"] != self.opened for r in rows):
+            with contextlib.suppress(Exception):
+                rows.append((await self.rpc("tail", id=self.opened, n=0))["session"])
         self.announce(rows)
         self.rows = rows
         self.rebuild()
+        await self.check_arrivals(rows)
+        self.polls += 1
+        if self.selected and self.polls % 5 == 0:
+            self.load_edited(self.selected)
         r = self.current()
-        if r and r.get("unread") and (not self.narrow or self.screen.has_class("detail-view")):
+        if (
+            r
+            and r.get("unread")
+            and self.screen is self.screen_stack[0]
+            and (not self.narrow or self.screen.has_class("detail-view"))
+        ):
             with contextlib.suppress(Exception):
                 await self.rpc("seen", id=r["id"])  # it's on screen: read
+        self.polled_at = time.monotonic()
+
+    def watchdog(self) -> None:
+        """The poll timer awaits each poll, so one that never finishes (or a cancelled one,
+        which ends the timer) would freeze the list for good: restart it."""
+        now, last = time.monotonic(), self.watched_at
+        self.update_connection()
+        self.watched_at = now
+        if now - last > 3:  # everything was frozen (e.g. the terminal stopped reading): wait
+            self.polled_at = now
+        elif now - self.polled_at > STALL:
+            self.polled_at = now
+            self.poll_timer.stop()  # cancels a poll stuck inside it
+            self.poll_timer = self.set_interval(1.0, self.poll)
+            self.notify("the list had stopped refreshing; restarted it", severity="warning")
 
     async def poll_usage(self) -> None:
+        """Plan limits under the list, with when each window resets."""
         try:
-            self.usage = usage_text(await self.rpc("usage")).plain
+            text = usage_text(await self.rpc("usage"), resets=True)
         except Exception:
-            self.usage = ""
-        self.update_subtitle()
+            text = Text()
+        box = self.query_one("#usage", Static)
+        box.update(text)
+        box.set_class(bool(text.plain), "has-usage")
+
+    def alert(self, msg: str, severity: SeverityLevel = "warning", timeout: float = 8) -> None:
+        """A toast; with `b` on, also the bell and a Mac notification."""
+        self.notify(msg, severity=severity, timeout=timeout)
+        if self.notify_on:
+            self.bell()
+            mac_notify(msg)
 
     def announce(self, rows: list[dict[str, Any]]) -> None:
         now = {r["id"] for r in rows if r["status"] == "awaiting_approval"}
         if self.approvals is not None:
             for r in rows:
                 if r["id"] in now - self.approvals:
-                    msg = f"{short_id(r['id'])} needs approval: {r['title'] or short_cwd(r['cwd'])}"
-                    self.notify(msg, severity="warning", timeout=8)
-                    if self.notify_on:
-                        self.bell()
-                        mac_notify(msg)
+                    asks = (r["pending_approval"] or {}).get("questions")
+                    what = "has a question" if asks else "needs approval"
+                    self.alert(f"{short_id(r['id'])} {what}: {name_of(r)}")
         self.approvals = now
+        t, utc = time.time(), datetime.now(UTC)
+        for r in rows:
+            sid, st = r["id"], r["status"]
+            if st in ("working", "awaiting_approval"):
+                self.working_since.setdefault(sid, t)
+            elif sid in self.working_since:
+                took = t - self.working_since.pop(sid)
+                if st != "ended" and took >= LONG_TURN:
+                    mins = round(took / 60)
+                    self.alert(f"{short_id(sid)} finished after {mins} min: {name_of(r)}",
+                               "information")  # fmt: skip
+            exp = r.get("cache_expires_at")
+            if exp and st in ("awaiting_input", "awaiting_approval"):
+                left = (datetime.fromisoformat(exp) - utc).total_seconds()
+                if 0 < left <= CACHE_WARN and (sid, exp) not in self.cache_warned:
+                    self.cache_warned.add((sid, exp))
+                    self.alert(f"{short_id(sid)}'s prompt cache expires in {int(left)}s; reply "
+                               f"before then to keep it: {name_of(r)}")  # fmt: skip
+
+    async def check_arrivals(self, rows: list[dict[str, Any]]) -> None:
+        """Did what you sent show up in the transcript? A toast when it does; a warning if it
+        still hasn't ARRIVAL_GRACE seconds after the agent was free to take it."""
+        byid = {r["id"]: r for r in rows}
+        for sid, entries in list(self.sent.items()):
+            waiting = [
+                e
+                for e in entries
+                if e["outcome"] not in ("failed", "cancelled") and "settled" not in e
+            ]
+            if not waiting:
+                continue
+            try:
+                history = await self.rpc("history", id=sid)
+                receipts = {e["id"]: e for e in history} if isinstance(history, list) else {}
+                events = (await self.rpc("tail", id=sid, n=200))["events"]
+                got = user_texts(events)
+            except Exception:
+                continue
+            r = byid.get(sid)
+            free = bool(r and r["status"] in ("awaiting_input", "idle") and not r.get("queued"))
+            for e in waiting:
+                receipt = receipts.get(e.get("id", ""))
+                arrived = (
+                    receipt.get("settled") == "arrived"
+                    if receipt
+                    else ("id" not in e and sent_key(e["text"]) in got)
+                )
+                if receipt:
+                    e["outcome"] = receipt["outcome"]
+                    if e["outcome"] in ("failed", "cancelled"):
+                        continue
+                if arrived:
+                    e["settled"] = "arrived"
+                    self.notify(f"{short_id(sid)} has your message: {first_line(e['text'])}",
+                                timeout=3)  # fmt: skip
+                elif not free:
+                    e.pop("free_at", None)
+                elif time.time() - e.setdefault("free_at", time.time()) >= ARRIVAL_GRACE:
+                    e["settled"] = "missing"
+                    self.alert(f"{short_id(sid)} still hasn't got {first_line(e['text'])!r}; "
+                               "h shows what you sent, to resend it", timeout=15)  # fmt: skip
         found = {(r["id"], c) for r in rows for c in r.get("conflicts") or []}
         if self.conflicts is not None:
             for sid, c in found - self.conflicts:
@@ -855,37 +1377,69 @@ class Watch(App[None]):
 
     def action_toggle_ended(self) -> None:
         self.show_ended = not self.show_ended
+        self.notify("Ended: last 24h by activity; f searches older history", timeout=5)
         self.rebuild()
 
     def rebuild(self) -> None:
         rows = self.filtered()
+        overview = Text()
+        counts = [
+            (sum(r["status"] == "awaiting_approval" for r in self.rows), "approval", "yellow"),
+            (sum(bool(r.get("unread")) for r in self.rows), "unread", "cyan"),
+            (sum(r["status"] == "working" for r in self.rows), "working", "green"),
+            (sum(bool(r.get("conflicts")) for r in self.rows), "overlap", "yellow"),
+        ]
+        for count, label, style in counts:
+            if count:
+                if overview.plain:
+                    overview.append(" · ", style="dim")
+                overview.append(f"{count} {label}", style=style)
+        overview = overview or Text("All caught up", style="dim")
+        if overview.plain != self.overview_shown:
+            self.overview_shown = overview.plain
+            self.query_one("#overview", Static).update(overview)
+        empty = self.query_one("#empty", Static)
+        visible = [r for r in rows if self.show_ended or self.filter or r["status"] != "ended"]
+        empty.set_class(not visible, "show")
+        empty_text = (
+            "No matching sessions.\nEsc clears the filter."
+            if self.filter
+            else "Ended sessions hidden (last 24h).\ne shows them; f searches older history."
+            if rows
+            else "No recent sessions.\nn starts one; f searches older history."
+        )
+        if empty_text != self.empty_shown:
+            self.empty_shown = empty_text
+            empty.update(Text(empty_text))
         shape = [
             (
                 r["id"], r["status"], r["title"], r["controllable"], age(r["last_activity"]),
                 r.get("unread"), len(r.get("conflicts") or []), len(r.get("queued") or []),
                 ctx_text(r, short=True).plain, cache_text(r, short=True).plain,
+                repr(r.get("preview")), repr(r.get("pending_approval")), r["cwd"],
+                r.get("project"), r["source"], r.get("origin"),
             )
             for r in rows
         ] + [(self.show_ended, self.by_project)]  # fmt: skip
         if shape != self.shape:
             self.shape = shape
             ol = self.query_one("#list", OptionList)
-            opts: list[Option] = self.project_options(rows) if self.by_project else []
+            opts: list[Option | None] = self.project_options(rows) if self.by_project else []
             for status, label in [] if self.by_project else GROUPS:
                 group = [r for r in rows if r["status"] == status]
                 if not group:
                     continue
-                style = STATUS_STYLE[status] if status == "awaiting_approval" else "bold dim"
                 folded = status == "ended" and not self.show_ended and not self.filter
                 more = " · e shows" if folded else ""
-                head = Text(f" {label} ({len(group)}){more} ", style=style)
+                head = group_heading(status, label, len(group), self.card_width(), more)
                 opts.append(Option(head, disabled=True))
                 if not folded:
-                    fmt = card_text if self.narrow else row_text
-                    opts += [Option(fmt(r), id=r["id"]) for r in group]
-            ids = [o.id for o in opts]
+                    opts += self.cards(group) if self.narrow else [
+                        Option(row_text(r), id=r["id"]) for r in group
+                    ]  # fmt: skip
+            ids = [o.id for o in opts if o]
             if ids == [o.id for o in ol.options]:  # same rows in place: new text, no relayout
-                for i, o in enumerate(opts):
+                for i, o in enumerate(o for o in opts if o):
                     if o.prompt != ol.get_option_at_index(i).prompt:
                         ol.replace_option_prompt_at_index(i, o.prompt)
             else:
@@ -901,6 +1455,11 @@ class Watch(App[None]):
                     i = next(i for i, x in enumerate(ids) if x)
                     ol.highlighted = i
                     self.select(ids[i])
+                else:
+                    self.selected, self.selected_pane = None, None
+                    self.header_shown = None
+                    self.clear_detail()
+                    self.show_files(None)
         row = next((r for r in rows if r["id"] == self.selected), None)
         # Each update relayouts the whole screen, transcript included: only on a change
         header = (str(row), self.narrow, cache_text(row).plain) if row else None
@@ -909,6 +1468,8 @@ class Watch(App[None]):
             self.query_one("#header", Static).update(session_header(row, compact=self.narrow))
         self.update_actions(row)
         self.update_queued(row)
+        self.update_composer()
+        self.update_tapbar()
         self.tick_running()
         keys = [self.check_action(b.action, ()) for b in self.BINDINGS if isinstance(b, Binding)]
         if keys != self.keys_shown:
@@ -925,39 +1486,53 @@ class Watch(App[None]):
         tree = self.query_one("#files", Files)
         if not root or not os.path.isdir(root):
             title.update(Text(f"FILES · {tilde(root)} is gone" if root else "FILES"))
-            tree.display = False
+            tree.remove_class("has-root")
             return
         title.update(Text(f"FILES · {tilde(root)}"))
-        tree.display = True
+        tree.add_class("has-root")
         if str(tree.path) != root:
             tree.path = root
 
-    def project_options(self, rows: list[dict[str, Any]]) -> list[Option]:
+    def card_width(self) -> int:
+        return (
+            self.query_one("#list", OptionList).scrollable_content_region.width or self.size.width
+        )
+
+    def cards(self, group: list[dict[str, Any]], folder: bool = True) -> list[Option | None]:
+        """Phone cards, a rule between each (None: OptionList's divider)."""
+        out: list[Option | None] = []
+        for r in group:
+            out += [Option(card_text(r, self.card_width(), folder), id=r["id"]), None]
+        return out[:-1]
+
+    def project_options(self, rows: list[dict[str, Any]]) -> list[Option | None]:
         """The list grouped by project (git repo, else folder): projects with sessions that
         need you first; inside each, the daemon's order (needs-you first, then recent)."""
         if not self.show_ended and not self.filter:
             rows = [r for r in rows if r["status"] != "ended"]
         projects: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
-            projects.setdefault(r.get("project") or short_cwd(r["cwd"]), []).append(r)
-        opts: list[Option] = []
-        for name, group in projects.items():  # rows are sorted, so is this
+            projects.setdefault(
+                r.get("project_path") or r.get("project") or short_cwd(r["cwd"]), []
+            ).append(r)
+        opts: list[Option | None] = []
+        for _, group in projects.items():  # rows are sorted, so is this
+            name = project_display(group[0])
             head = Text(f" {name} ({len(group)}) ", style="bold")
             for status in ("awaiting_approval", "awaiting_input", "working"):
                 n = sum(r["status"] == status for r in group)
                 if n:
                     head.append(f"{n} ").append_text(status_text(status)).append(" ")
             opts.append(Option(head, disabled=True))
-            opts += [
-                Option(
-                    card_text(r, folder=False) if self.narrow else row_text(r, status=True),
-                    id=r["id"],
-                )
-                for r in group
-            ]
+            opts += self.cards(group, folder=False) if self.narrow else [
+                Option(row_text(r, status=True), id=r["id"]) for r in group
+            ]  # fmt: skip
         if not self.show_ended and not self.filter:
             opts.append(
-                Option(Text(" ended sessions hidden · e shows", style="dim"), disabled=True)
+                Option(
+                    Text(" ended (last 24h) hidden · e shows · f searches older", style="dim"),
+                    disabled=True,
+                )
             )
         return opts
 
@@ -967,19 +1542,31 @@ class Watch(App[None]):
         self.rebuild()
 
     def update_actions(self, row: dict[str, Any] | None) -> None:
-        """Tappable approval buttons, one per option, under the transcript."""
+        """Tappable approval buttons, one per option, under the transcript, below what they
+        approve (on a phone the tool call is folded away in the transcript)."""
         appr = row and row["status"] == "awaiting_approval" and row["pending_approval"]
         choices = (appr["options"] or {"1": "Approve", "0": "Deny"}) if appr else None
-        if choices == self.choices:
+        tool = appr and appr.get("tool")
+        if appr and (qs := appr.get("questions")):
+            choices = {"q": f"answer: {qs[0].get('question')}", "0": "cancel the question"}
+            tool = None  # the answer button says what it asks
+        controllable = bool(row and row["controllable"])
+        if (tool, choices, controllable) == self.actions_shown:
             return
-        self.choices = choices
+        self.actions_shown = (tool, choices, controllable)
         box = self.query_one("#actions", Vertical)
         box.remove_children()
         box.set_class(bool(choices), "show")
+        if tool:
+            box.mount(Static(Text(f"! {tool}", style="bold yellow")))
+        if choices and not controllable:
+            reason = (row or {}).get("control_reason") or "Read only · answer in the owning app"
+            box.mount(Static(Text(reason, style="dim")))
         for k, label in (choices or {}).items():
             no = label.lower().startswith(("no", "reject", "deny"))
-            variant: ButtonVariant = "error" if no else "success" if k == "1" else "default"
-            box.mount(Button(f"{k}. {label}" if k != "0" else label, id=f"opt{k}", variant=variant))
+            variant: ButtonVariant = "error" if no else "success" if k in "1q" else "default"
+            text = label if k in "0q" else f"{k}. {label}"
+            box.mount(Button(text, id=f"opt{k}", variant=variant, disabled=not controllable))
 
     def tick_running(self) -> None:
         """While it works: what it's running and for how long, so a long command isn't
@@ -997,14 +1584,20 @@ class Watch(App[None]):
     def update_queued(self, row: dict[str, Any] | None) -> None:
         """Messages waiting for the agent to be free; tap one to cancel it."""
         items = list((row or {}).get("queued") or [])
-        if items == self.queued_shown:
+        error = (row or {}).get("queue_error")
+        shown = (items, error)
+        if shown == self.queued_shown:
             return
-        self.queued_shown = items
+        self.queued_shown = shown
         box = self.query_one("#queued", Vertical)
         box.remove_children()
-        box.display = bool(items)
+        box.display = bool(items or error)
+        if error:
+            box.mount(
+                Static(Text(f"Delivery held: {error}. Inspect terminal/history before retrying."))
+            )
         for i, text in enumerate(items):
-            box.mount(Button(f"queued: {first_line(text)}  ✕", name=str(i)))
+            box.mount(Button(f"queued: {first_line(text)} · cancel", name=str(i)))
 
     @on(Button.Pressed, "#queued Button")
     async def unqueue_pressed(self, event: Button.Pressed) -> None:
@@ -1012,7 +1605,7 @@ class Watch(App[None]):
             i = int(event.button.name or 0)
             try:
                 await self.rpc("unqueue", id=self.selected, index=i)
-                self.notify("✓ cancelled", timeout=2)
+                self.notify("Cancelled", timeout=2)
             except Exception as e:
                 self.notify(str(e), severity="error", timeout=8)
             await self.poll()
@@ -1020,18 +1613,36 @@ class Watch(App[None]):
     @on(Button.Pressed, "#actions Button")
     async def option_pressed(self, event: Button.Pressed) -> None:
         key = (event.button.id or "")[3:]
-        if key == "0":
+        if key == "q":
+            self.action_answer()
+        elif key == "0":
             await self.action_deny()
         elif key:
             await self.control("approve", allow=True, choice=int(key))
 
-    @on(OptionList.OptionHighlighted)
+    @on(OptionList.OptionHighlighted, "#list")  # not the lists in dialogs
     def highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        listing = self.query_one("#list", OptionList)
+        if listing.highlighted is None or (
+            listing.get_option_at_index(listing.highlighted).id != event.option.id
+        ):
+            return  # discard a highlight posted before a refresh or a later navigation event
         self.select(event.option.id)
+        if self.prompt_mode:
+            self.query_one("#prompt", Prompt).focus()
 
     def select(self, sid: str | None) -> None:
         if sid and sid != self.selected:
+            if sid != self.opened:
+                self.opened = None
             self.selected = sid
+            listing = self.query_one("#list", OptionList)
+            for index, option in enumerate(listing.options):
+                if option.id == sid and listing.highlighted != index:
+                    listing.highlighted = index
+                    break
+            self.load_history(sid)
+            self.load_edited(sid)
             self.selected_pane = (self.current() or {}).get("tmux_pane")
             self.stream(sid)
             self.show_files(self.current())
@@ -1040,15 +1651,26 @@ class Watch(App[None]):
             self.refresh_bindings()
 
     @work(exclusive=True, group="follow")
+    async def clear_detail(self) -> None:
+        self.stream_state = "Select a session to read its transcript"
+        self.update_connection()
+        self.query_one("#header", Static).update(Text("Select a session", style="dim"))
+        await self.query_one("#log", Transcript).reset(self.narrow, self.markdown)
+
+    @work(exclusive=True, group="follow")
     async def stream(self, sid: str) -> None:
         """Follow the session's events. If the stream drops (e.g. the daemon restarted), keep
         reconnecting, with the transcript reloaded each time, until another session is picked."""
         log = self.query_one("#log", Transcript)
+        self.stream_state = "Loading transcript"
+        self.update_connection()
         while True:
             row = self.current()
             try:
                 it = self.follow_fn(sid)
                 first = await anext(it)
+                self.stream_state = "Transcript connected"
+                self.update_connection()
                 await log.reset(self.narrow, self.markdown, row.get("seen_at") if row else None)
                 s = first["session"]
                 self.query_one("#header", Static).update(session_header(s, compact=self.narrow))
@@ -1062,9 +1684,29 @@ class Watch(App[None]):
                 pass
             if self.selected != sid:
                 return
+            self.stream_state = "Transcript reconnecting"
+            self.update_connection()
             await asyncio.sleep(1)
 
     # --- navigation ---
+
+    def on_key(self, event: events.Key) -> None:
+        if (
+            self.prompt_mode
+            and not self.submitting
+            and event.is_printable
+            and self.screen is self.screen_stack[0]
+        ):
+            # A click on the transcript may move focus; keep subsequent typing in the draft.
+            prompt = self.query_one("#prompt", Prompt)
+            if self.focused is not prompt and event.character:
+                event.prevent_default()
+                event.stop()
+                prompt.focus()
+                prompt.insert(event.character)
+
+    def action_quit_app(self) -> None:
+        self.exit()
 
     def action_down(self) -> None:
         w = self.focused
@@ -1082,50 +1724,252 @@ class Watch(App[None]):
 
     @on(OptionList.OptionSelected, "#list")  # not the lists in dialogs
     async def action_open(self) -> None:
-        r = self.current()
-        if r and r["tmux_pane"]:
+        if self.prompt_mode:
+            self.query_one("#prompt", Prompt).focus()
+            return
+        row = self.current()
+        if not self.narrow and row and row.get("tmux_pane"):
             await self.action_attach()
-        elif r and not r["controllable"] and r["status"] != "ended":
-            self.action_adopt()  # open in another terminal: offer to move it here
         else:
             self.action_log()
 
     def action_log(self) -> None:
         if self.selected:
+            self.screen.remove_class("show-files", "files-view")
             self.screen.add_class("detail-view")
             self.query_one("#log", Transcript).focus()
             self.refresh_bindings()
+            self.update_tapbar()
+
+    def action_files(self) -> None:
+        """Phone: a project page. Desktop: an optional browser under the session list."""
+        if not self.narrow:
+            shown = not self.screen.has_class("show-files")
+            if shown:
+                self.files_return_fullscreen = self.screen.has_class("detail-view")
+                self.files_return_focus = getattr(self.focused, "id", None) or "list"
+                self.screen.remove_class("detail-view")
+                self.screen.add_class("show-files")
+                self.query_one("#files").focus()
+            else:
+                self.screen.remove_class("show-files")
+                self.screen.set_class(self.files_return_fullscreen, "detail-view")
+                self.query_one(f"#{self.files_return_focus}").focus()
+            self.refresh_bindings()
+            return
+        if self.screen.has_class("files-view"):
+            self.screen.remove_class("files-view")
+            self.query_one("#log").focus()
+            self.refresh_bindings()
+            self.update_tapbar()
+            return
+        self.screen.add_class("files-view")
+        self.query_one("#files", Files).focus()
+        self.update_tapbar()
 
     def action_leave(self) -> None:
         if self.prompt_mode:
+            if self.submitting:
+                return
             self.close_prompt(clear_filter=self.prompt_mode == "filter")
             return
-        self.screen.remove_class("detail-view")
-        self.query_one("#list", OptionList).focus()
+        if self.screen.has_class("files-view"):  # back to the session
+            self.screen.remove_class("files-view")
+            self.query_one("#log", Transcript).focus()
+        elif self.screen.has_class("show-files"):
+            self.action_files()
+        elif not self.screen.has_class("detail-view") and self.filter:
+            self.filter = ""
+            self.rebuild()
+            self.update_subtitle()
+        else:
+            self.screen.remove_class("detail-view")
+            self.query_one("#list", OptionList).focus()
         self.refresh_bindings()
+        self.update_tapbar()
+
+    def page(self) -> str:
+        sc = self.screen_stack[0]  # the dashboard, even under a dialog
+        return "files" if sc.has_class("files-view") else "session" if sc.has_class(
+            "detail-view") else "list"  # fmt: skip
+
+    def update_tapbar(self) -> None:
+        """Phone: the big buttons along the bottom, for what this page is for."""
+        if not self.narrow and not self.prompt_mode:
+            if self.tapbar_shown:
+                self.query_one("#tapbar").remove_children()
+                self.tapbar_shown = []
+            return
+        page = self.page()
+        if self.prompt_mode:  # typing: a phone keyboard has no esc, and enter isn't obvious
+            done = {"filter": "done", "rename": "save"}.get(self.prompt_mode, "send")
+            if self.prompt_mode in ("send", "queue") and self.composer_queues():
+                done = "queue"
+            if self.submitting:
+                done = "sending…"
+            wanted = [("cancel", "leave"), (done, "submit")]
+        elif page == "list":
+            unread = sum(1 for r in self.rows if r.get("unread"))
+            waiting = sum(1 for r in self.rows if r["status"] == "awaiting_approval")
+            wanted = []
+            for label, a in TAPBAR[page]:
+                if a == "search" and waiting:  # approving goes via its page, where you see
+                    label, a = f"review {waiting}", "review"  # what; search is under more
+                elif a == "digest":
+                    if not unread:
+                        continue
+                    label = f"unread {unread}"
+                wanted.append((label, a))
+        else:
+            wanted = TAPBAR[page]
+        items = [
+            (label, a)
+            for label, a in wanted
+            if self.prompt_mode or a == "menu" or self.check_action(a, ())
+        ]
+        if items == self.tapbar_shown:
+            return
+        self.tapbar_shown = items
+        bar = self.query_one("#tapbar", Horizontal)
+        bar.remove_children()
+        buttons = [
+            Button(
+                label, name=a, variant=TAPBAR_VARIANT.get(a, "default"), disabled=self.submitting
+            )
+            for label, a in items
+        ]
+        for b in buttons:
+            b.can_focus = False  # for tapping; Tab keeps moving between the panes
+        bar.mount_all(buttons)
+
+    @on(Button.Pressed, "#tapbar Button")
+    async def tapbar_pressed(self, event: Button.Pressed) -> None:
+        await self.run_action(event.button.name or "")
+
+    def action_review(self) -> None:
+        """Phone: the page of the highlighted session if it's waiting on you, else the first
+        that is, with its approval buttons under what they approve."""
+        r = self.current()
+        if not (r and r["status"] == "awaiting_approval"):
+            r = next((x for x in self.rows if x["status"] == "awaiting_approval"), None)
+        if r:
+            self.filter = ""
+            self.update_subtitle()
+            self.select(r["id"])
+            self.rebuild()
+            self.action_log()
+
+    def action_submit(self) -> None:
+        inp = self.query_one("#prompt", Prompt)
+        if self.prompt_mode and not self.submitting:
+            inp.action_submit()
+
+    def action_menu(self) -> None:
+        items = [(label, a) for label, a in MENU[self.page()] if self.check_action(a, ())]
+
+        def chosen(action: str | None) -> None:
+            if action:
+                self.call_later(self.run_action, action)
+
+        self.push_screen(Menu(items), chosen)
 
     # --- prompt (send / filter) ---
 
-    def open_prompt(self, mode: str, placeholder: str, value: str = "") -> None:
-        self.prompt_mode, self.prompt_target = mode, self.selected
+    def open_prompt(
+        self, mode: str, placeholder: str, value: str | None = None, target: str | None = None
+    ) -> None:
+        if self.prompt_mode:
+            self.query_one("#prompt", Prompt).focus()
+            return
+        target = target or self.selected
+        self.prompt_return_focus = getattr(self.focused, "id", None) or "list"
+        if self.prompt_return_focus not in ("list", "log", "files"):
+            self.prompt_return_focus = "log" if self.screen.has_class("detail-view") else "list"
+        self.prompt_mode, self.prompt_target = mode, target
+        self.screen.add_class("composing")
+        self.prompt_token += 1
         inp = self.query_one("#prompt", Prompt)
-        sends = self.sent.get(self.selected or "", []) if mode in ("send", "queue") else []
+        inp.token, inp.submitted, inp.read_only = self.prompt_token, False, False
+        sends = self.sent.get(target or "", []) if mode in ("send", "queue") else []
         inp.sends, inp.recall, inp.draft = [s["text"] for s in sends], 0, ""
         inp.placeholder = placeholder
+        if value is None:
+            value = self.drafts.get((mode, target or ""), "")
         inp.load_text(value)
         inp.move_cursor(inp.document.end)
         inp.add_class("show")
         inp.focus()
+        box = self.query_one("#replies", Horizontal)
+        box.remove_children()
+        box.set_class(mode in ("send", "queue"), "show")
+        if mode in ("send", "queue"):
+            replies = quick_replies()[:3] if self.narrow else quick_replies()  # room to read
+            box.mount_all(Button(f"› {r}" if self.narrow else r, name=r) for r in replies)
+        self.update_composer()
+        self.refresh_bindings()
+        self.update_tapbar()
 
-    def close_prompt(self, clear_filter: bool = False) -> None:
+    def composer_queues(self) -> bool:
+        target = next((r for r in self.rows if r["id"] == self.prompt_target), None)
+        return self.prompt_mode == "queue" or bool(
+            target
+            and (target["status"] in ("working", "awaiting_approval") or target.get("queued"))
+        )
+
+    def update_composer(self) -> None:
+        if not self.prompt_mode:
+            return
+        target = next((r for r in self.rows if r["id"] == self.prompt_target), None)
+        name = name_of(target) if target else short_id(self.prompt_target or "")
+        if self.prompt_mode in ("send", "queue"):
+            verb = "Queue" if self.prompt_mode == "queue" else "Reply"
+            text = f"{verb} to {name} · {short_id(self.prompt_target or '')}"
+            if self.submitting:
+                text += "\nSending… draft preserved"
+            else:
+                text += "\nEnter queues" if self.composer_queues() else "\nEnter sends"
+                text += " · Shift+Enter newline · Esc saves draft"
+        else:
+            text = (
+                "Filter sessions · Enter applies · Esc clears"
+                if self.prompt_mode == "filter"
+                else f"Rename {name} · Enter saves · Esc cancels"
+            )
+        title = self.query_one("#composer-title", Static)
+        title.add_class("show")
+        if text != self.composer_shown:
+            self.composer_shown = text
+            title.update(Text(text, style="bold"))
+        for reply in self.query("#replies Button").results(Button):
+            reply.disabled = self.submitting
+
+    def close_prompt(self, clear_filter: bool = False, discard: bool = False) -> None:
+        inp = self.query_one("#prompt", Prompt)
+        key = (self.prompt_mode or "", self.prompt_target or "")
+        if self.prompt_mode in ("send", "queue"):
+            if discard:
+                self.drafts.pop(key, None)
+            else:
+                self.drafts[key] = inp.text
         if clear_filter:
             self.filter = ""
             self.rebuild()
             self.update_subtitle()
-        self.prompt_mode = None
-        self.query_one("#prompt", Prompt).remove_class("show")
-        target = "#log" if self.screen.has_class("detail-view") else "#list"
-        self.query_one(target).focus()
+        self.prompt_mode, self.prompt_target = None, None
+        self.screen.remove_class("composing")
+        self.prompt_token += 1
+        inp.submitted, inp.read_only = False, False
+        inp.remove_class("show")
+        self.query_one("#composer-title").remove_class("show")
+        self.query_one("#replies", Horizontal).remove_class("show")
+        focus = self.prompt_return_focus
+        if focus == "log" and self.narrow and not self.screen.has_class("detail-view"):
+            focus = "list"
+        if focus == "files" and not self.query_one("#files").display:
+            focus = "log" if self.screen.has_class("detail-view") else "list"
+        self.query_one(f"#{focus}").focus()
+        self.refresh_bindings()
+        self.update_tapbar()
 
     def action_send(self) -> None:
         # Always open the box, even where sending will fail (the error says why and the text is
@@ -1134,6 +1978,42 @@ class Watch(App[None]):
             self.open_prompt(
                 "send", f"message to {short_id(self.selected)} · enter sends · esc cancels"
             )
+
+    @on(Button.Pressed, "#replies Button")
+    def reply_pressed(self, event: Button.Pressed) -> None:
+        inp = self.query_one("#prompt", Prompt)
+        if self.submitting:
+            return
+        inp.insert(event.button.name or "")
+        inp.focus()
+
+    @work(exclusive=True, group="edited")
+    async def load_edited(self, sid: str) -> None:
+        with contextlib.suppress(Exception):
+            self.query_one("#files", Files).set_edited(await self.rpc("edited", id=sid))
+
+    @on(DirectoryTree.FileSelected, "#files")
+    def file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        self.open_diff(str(event.path))
+
+    @work(exclusive=True, group="diff")
+    async def open_diff(self, path: str) -> None:
+        from agentctl.daemon.fleet import file_diff
+
+        self.push_screen(Diff(path, await asyncio.to_thread(file_diff, path)))
+
+    @work
+    async def action_search(self) -> None:
+        sid = await self.push_screen_wait(Search(self.rpc))
+        if sid:
+            self.filter = ""
+            self.update_subtitle()
+            self.opened = sid
+            self.show_ended = True  # it may well be an ended one
+            self.select(sid)  # before the list is rebuilt, so the highlight lands on it
+            await self.poll()
+            self.show_files(self.current())  # select() ran before its row was listed
+            self.action_log()
 
     def action_filter(self) -> None:
         self.open_prompt("filter", "filter by id, title or folder · esc clears", self.filter)
@@ -1147,33 +2027,76 @@ class Watch(App[None]):
 
     @on(Prompt.Submitted)
     async def prompt_submitted(self, event: Prompt.Submitted) -> None:
+        if self.submitting or not self.prompt_mode or event.token != self.prompt_token:
+            return
         mode, target, text = self.prompt_mode, self.prompt_target, event.value
-        placeholder = self.query_one("#prompt", Prompt).placeholder
-        self.close_prompt()
-        if mode in ("send", "queue") and text.strip() and target:
-            ok = await self.control(mode, sid=target, text=text)
-            outcome = self.last_outcome if ok else "failed"
+        inp = self.query_one("#prompt", Prompt)
+        if mode in ("send", "queue") and (not text.strip() or not target):
+            inp.submitted = False
+            inp.focus()
+            return
+        if mode == "filter":
+            self.filter = text
+            self.rebuild()
+            self.close_prompt()
+            return
+        self.submitting, inp.read_only = True, True
+        self.prompt_token += 1
+        inp.token = self.prompt_token
+        self.update_composer()
+        self.refresh_bindings()
+        self.update_tapbar()
+        self.deliver_prompt(mode, target, text)
+
+    @work(group="send")
+    async def deliver_prompt(self, mode: str, target: str | None, text: str) -> None:
+        """Keep input and rendering responsive while the daemon acknowledges a delivery."""
+        inp = self.query_one("#prompt", Prompt)
+        if mode in ("send", "queue") and target:
+            created = time.time()
+            result = await self.control(mode, sid=target, text=text)
+            ok = bool(result)
             at = datetime.now().strftime("%H:%M:%S")
-            entry = {"at": at, "text": text, "outcome": outcome, "error": self.last_error}
-            self.sent.setdefault(target, []).append(entry)
+            entry = {
+                "at": at,
+                "created": created,
+                "text": text,
+                "outcome": result.outcome,
+                "error": result.error,
+            }
+            if result.command_id:
+                entry["id"] = result.command_id
+            entries = self.sent.setdefault(target, [])
+            if not any(e.get("id") == result.command_id for e in entries if result.command_id):
+                entries.append(entry)
             if not ok:
-                self.open_prompt(mode, str(placeholder), text)  # failed: keep what was typed
-                self.prompt_target = target
+                self.drafts[(mode, target)] = text
         elif mode == "rename":
-            await self.control("rename", sid=target, title=text)
+            ok = bool(await self.control("rename", sid=target, title=text))
+        else:
+            ok = True
+        self.submitting, inp.read_only, inp.submitted = False, False, False
+        if ok:
+            self.close_prompt(discard=True)
+        else:
+            inp.focus()
+            self.update_composer()
+            self.refresh_bindings()
+            self.update_tapbar()
 
     # --- control ---
 
-    async def control(self, method: str, sid: str | None = None, **params: Any) -> bool:
+    async def control(self, method: str, sid: str | None = None, **params: Any) -> ControlResult:
         sid = sid or self.selected
         if not sid:
-            return False
+            return ControlResult("failed", "No session selected")
         try:
-            self.last_error = ""
             r = await self.rpc(method, id=sid, **params)
             if "queued" in r:
                 method = "queue"
-            self.last_outcome = "queued" if method == "queue" else "sent"
+            result = ControlResult(
+                "queued" if method == "queue" else "sent", command_id=r.get("command_id")
+            )
             done = r.get("chosen") or {
                 "send": "sent",
                 "interrupt": "interrupted",
@@ -1181,24 +2104,45 @@ class Watch(App[None]):
                 "rename": "renamed",
                 "queue": f"busy: queued ({len(r.get('queued') or [])} waiting)",
             }.get(method, method)
-            self.notify(f"✓ {short_id(sid)} {done}", timeout=3)
-            ok = True
+            self.notify(f"{short_id(sid)} {done}", timeout=3)
         except Exception as e:
             self.notify(str(e), severity="error", timeout=8)
-            self.last_error = str(e)
-            ok = False
+            result = ControlResult("failed", str(e))
+        self.refresh_after_control()
+        return result
+
+    @work(exclusive=True, group="control-refresh")
+    async def refresh_after_control(self) -> None:
         await self.poll()
-        return ok
 
     async def action_approve(self) -> None:
-        await self.control("approve", allow=True)
+        if self.questions():
+            self.action_answer()
+        else:
+            await self.control("approve", allow=True)
+
+    def questions(self) -> list[dict[str, Any]]:
+        r = self.current()
+        appr = r and r["status"] == "awaiting_approval" and r["pending_approval"]
+        return list(appr.get("questions") or []) if appr else []
+
+    @work
+    async def action_answer(self) -> None:
+        """The agent asked (AskUserQuestion): answer it in a form, typed into its menu."""
+        sid, qs, r = self.selected, self.questions(), self.current()
+        if r and qs and not r["controllable"]:  # e.g. the Codex desktop app has it open
+            self.notify("it's open in another app: answer it there", severity="warning")
+        elif sid and qs and (answers := await self.push_screen_wait(Questions(qs))):
+            await self.control("answer", sid=sid, answers=answers)
 
     async def action_deny(self) -> None:
         await self.control("approve", allow=False)
 
     async def action_choose(self, n: int) -> None:
         row = next((r for r in self.rows if r["id"] == self.selected), None)
-        if row and row["status"] == "awaiting_approval":
+        if self.questions():
+            self.action_answer()
+        elif row and row["status"] == "awaiting_approval":
             await self.control("approve", allow=True, choice=n)
 
     async def action_interrupt(self) -> None:
@@ -1232,6 +2176,8 @@ class Watch(App[None]):
             return
         sid = await self.push_screen_wait(Digest(rows))
         if sid:
+            self.filter = ""
+            self.update_subtitle()
             self.select(sid)
             self.rebuild()
             self.action_log()  # came to read what's new
@@ -1257,7 +2203,7 @@ class Watch(App[None]):
         rows = sorted(self.rows, key=lambda r: r["last_activity"], reverse=True)
         cur = self.current()
         folders = [cur["cwd"]] if cur and cur["cwd"] else []
-        folders += [r["cwd"] for r in rows if r["cwd"] and r["cwd"] not in folders]
+        folders = list(dict.fromkeys(folders + [r["cwd"] for r in rows if r["cwd"]]))
         choice = await self.push_screen_wait(NewSession(self.agents, folders[:8]))
         if not choice:
             return
@@ -1269,6 +2215,35 @@ class Watch(App[None]):
             self.notify(str(e), severity="error", timeout=10)
             return
         await self.jump(r["socket"], r["pane"])
+
+    @work(exclusive=True, group="teams")
+    async def action_teams(self) -> None:
+        from agentctl.tui.teams import TeamsScreen
+
+        while True:
+            intent = await self.push_screen_wait(TeamsScreen(self.rpc))
+            self.on_resize()  # the terminal may have resized while the dashboard was covered
+            if not intent:
+                return
+            if intent.action == "new":
+                await self.action_new().wait()
+                continue
+            if intent.session_id:
+                await self.poll()
+                self.select(intent.session_id)
+                self.rebuild()
+                if intent.action == "reply":
+                    self.open_prompt(
+                        "send",
+                        "message to coordinator or worker · enter sends",
+                        value=intent.text,
+                        target=intent.session_id,
+                    )
+                elif intent.action == "transcript":
+                    self.action_log()
+                elif intent.action == "terminal":
+                    await self.action_attach()
+            return
 
     async def jump(self, sock: str | None, pane: str) -> None:
         """Into the agent's pane until ctrl-] d (or it exits), then back here on that session.
@@ -1305,7 +2280,28 @@ class Watch(App[None]):
         except (AdoptError, DaemonError) as e:
             self.notify(str(e), severity="error", timeout=10)
             return
-        self.notify(f"✓ {short_id(plan.session['id'])} is now in agentctl", timeout=5)
+        self.notify(f"{short_id(plan.session['id'])} is now in agentctl", timeout=5)
+        await self.poll()
+
+    @work
+    async def action_hide(self) -> None:
+        r = self.current()
+        if not r:
+            return
+        sid = r["id"]
+        if not await self.push_screen_wait(
+            Confirm(
+                "Hide this session? Its agent keeps running; new activity can restore it.",
+                "Hide only",
+            )
+        ):
+            return
+        try:
+            await self.rpc("hide", id=sid)
+            self.removed = sid
+            self.notify(f"Hidden {short_id(sid)} · z unhides it", timeout=6)
+        except Exception as e:
+            self.notify(str(e), severity="error", timeout=8)
         await self.poll()
 
     @work
@@ -1315,7 +2311,7 @@ class Watch(App[None]):
             return
         name, sid = r["title"] or short_cwd(r["cwd"]), r["id"]
         if r["tmux_pane"]:
-            q = f"Quit {name} and remove it from the list? It stays resumable: o reopens it."
+            q = f"Quit {name} and hide it? z only unhides it; o resumes the stopped chat."
         else:
             q = f"Remove {name} from the list? Nothing is deleted; it's back if it gets active."
         if not await self.push_screen_wait(
@@ -1327,7 +2323,7 @@ class Watch(App[None]):
                 await self.rpc("close", id=sid)
             await self.rpc("hide", id=sid)
             self.removed = sid
-            self.notify(f"✓ removed {short_id(sid)} · z brings it back", timeout=6)
+            self.notify(f"Hidden {short_id(sid)} · z unhides it (does not restart it)", timeout=6)
         except Exception as e:
             self.notify(str(e), severity="error", timeout=8)
         await self.poll()
@@ -1337,7 +2333,7 @@ class Watch(App[None]):
         if sid:
             try:
                 await self.rpc("unhide", id=sid)
-                self.notify(f"✓ {short_id(sid)} is back", timeout=3)
+                self.notify(f"{short_id(sid)} is back", timeout=3)
             except Exception as e:
                 self.notify(str(e), severity="error", timeout=8)
             await self.poll()
@@ -1345,22 +2341,59 @@ class Watch(App[None]):
             self.rebuild()
 
     @work
+    async def action_results(self) -> None:
+        row = self.current()
+        if not row:
+            return
+        try:
+            report = await self.rpc("review", id=row["id"])
+        except Exception as e:
+            if "unknown method" not in str(e) or "review" not in str(e):
+                self.notify(str(e), severity="error")
+                return
+            # An editable install can update this UI while an older daemon is still running.
+            # Its existing tail API supplies the same local evidence without restarting agents.
+            from agentctl.daemon.fleet import review_turn
+            from agentctl.models import Session, SessionEvent
+
+            try:
+                snapshot = await self.rpc("tail", id=row["id"], n=500)
+                session = Session.model_validate(snapshot["session"])
+                events = [SessionEvent.model_validate(ev) for ev in snapshot["events"]]
+                report = await asyncio.to_thread(review_turn, session, events)
+            except Exception as fallback_error:
+                self.notify(str(fallback_error), severity="error")
+                return
+        self.push_screen(Review(name_of(row), report))
+
+    async def refresh_history(self, sid: str) -> None:
+        history = await self.rpc("history", id=sid)
+        if isinstance(history, list):
+            # Keep local connection failures which never reached the daemon.
+            local = [e for e in self.sent.get(sid, []) if "id" not in e]
+            self.sent[sid] = [*history, *local]
+
+    @work(exclusive=True, group="history")
+    async def load_history(self, sid: str) -> None:
+        with contextlib.suppress(Exception):
+            await self.refresh_history(sid)
+
+    @work
     async def action_history(self) -> None:
         r = self.current()
         if not r:
             return
         arrived: set[str] = set()
+        with contextlib.suppress(Exception):
+            await self.refresh_history(r["id"])
         with contextlib.suppress(Exception):  # which sends show up in its transcript
-            evs = (await self.rpc("tail", id=r["id"], n=500))["events"]
-            arrived = {
-                str(e["payload"].get("text", "")).strip()
-                for e in evs
-                if e["kind"] == "message" and e["payload"].get("role") == "user"
-            }
+            arrived = user_texts((await self.rpc("tail", id=r["id"], n=500))["events"])
         title = r["title"] or short_id(r["id"])
         text = await self.push_screen_wait(History(title, self.sent.get(r["id"], []), arrived))
         if text:
-            self.open_prompt("send", f"message to {short_id(r['id'])} · enter sends", text)
+            self.open_prompt(
+                "send", f"message to {short_id(r['id'])} · enter sends", text, target=r["id"]
+            )
 
     async def action_refresh(self) -> None:
         """Reload everything: list, transcript, files."""

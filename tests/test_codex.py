@@ -77,7 +77,8 @@ def test_fake_app_server_send_and_approve(tmp_path: Path) -> None:
         )
         await a.send(tid, "please touch x")
         for _ in range(250):  # up to 5s: a busy machine can be slow to start the fake server
-            if s.status == "awaiting_approval":
+            # Status and prompt details arrive in separate app-server messages.
+            if s.status == "awaiting_approval" and s.pending_approval is not None:
                 break
             await asyncio.sleep(0.02)
         assert s.pending_approval and s.pending_approval.tool == "shell: touch x"
@@ -164,3 +165,108 @@ def test_limits_survive_an_empty_bucket_report(tmp_path: Path) -> None:
         ("5h", 99.0),
         ("week", 43.0),
     ]
+
+
+def test_request_user_input_is_shown_and_answered(tmp_path: Path, monkeypatch: object) -> None:
+    import pytest
+
+    from agentctl import tmux
+    from agentctl.adapters import codex
+
+    mp = monkeypatch
+    assert isinstance(mp, pytest.MonkeyPatch)
+    meta = Path(__file__).parent / "fixtures" / "codex_paginated.jsonl"
+    tid = "01a00000-0000-7000-8000-000000000002"
+    p = tmp_path / f"rollout-2026-10-17T20-28-28-{tid}.jsonl"
+    raw = [
+        {"id": "colour", "header": "Colour", "question": "Colour?", "isOther": True,
+         "options": [{"label": "red", "description": ""}, {"label": "blue", "description": ""}]},
+        {"id": "name", "header": "Name", "question": "Name?", "options": None},
+    ]  # fmt: skip
+    call = {"type": "function_call", "name": "request_user_input", "call_id": "c1",
+            "arguments": json.dumps({"questions": raw})}  # fmt: skip
+    line = {"timestamp": "2026-10-17T14:58:48.306Z", "type": "response_item", "payload": call}
+    p.write_text(meta.read_text().splitlines()[0] + "\n" + json.dumps(line) + "\n")
+    reg = Registry(Bus())
+    a = CodexAdapter(reg, root=tmp_path, exe="/usr/bin/false")
+    a.open_rollout(p, startup=False)
+    s = reg.sessions[tid]
+    assert s.status == "awaiting_approval" and s.pending_approval
+    qs = s.pending_approval.questions
+    assert [q["id"] for q in qs] == ["colour", "name"] and qs[1]["options"] == []
+
+    sent: list[str] = []
+
+    async def keys(sock: object, pane: str, *k: str) -> None:
+        sent.extend(k)
+
+    async def literal(sock: object, pane: str, text: str) -> None:
+        sent.append(f"<{text}>")
+
+    async def verified(t: str) -> tuple[str, str]:
+        return "sock", "%1"
+
+    async def nap(_: float) -> None:
+        pass
+
+    mp.setattr(tmux, "keys", keys)
+    mp.setattr(tmux, "literal", literal)
+    mp.setattr(a, "verified", verified)
+    mp.setattr(asyncio, "sleep", nap)
+    answers = [{"text": "teal"}, {"text": "sam"}]
+    assert asyncio.run(a.answer(tid, answers)) == "teal; sam"
+    # "None of the above" is after the options: down to it, tab for its note, type, enter
+    assert sent == ["Down", "Down", "Tab", "<teal>", "Enter", "<sam>", "Enter"]
+    assert s.status != "awaiting_approval"  # answered
+
+    class Server:  # our own app-server asked instead: the answer is a reply, no keys
+        replies: list[tuple[object, object]] = []
+
+        def respond(self, rid: object, result: object = None, error: str | None = None) -> None:
+            self.replies.append((rid, result))
+
+    srv = Server()
+    a.server = srv  # type: ignore[assignment]
+    a.pending[tid] = {"id": 7, "method": codex.ASK, "params": {"questions": raw}}
+    a.announce(tid, codex.ASK, {"questions": raw})
+    sent.clear()
+    asyncio.run(a.answer(tid, [{"choices": [2]}, {"text": "sam"}]))
+    assert not sent and tid not in a.pending
+    expected = {"answers": {"colour": {"answers": ["blue"]}, "name": {"answers": ["sam"]}}}
+    assert srv.replies == [(7, expected)]
+
+    done = {"type": "function_call_output", "call_id": "c1", "output": "{}"}
+    with p.open("a") as f:
+        f.write(json.dumps({"timestamp": "2026-10-17T14:59:31Z", "type": "response_item",
+                            "payload": done}) + "\n")  # fmt: skip
+    r = a.rollouts[tid]
+    r.asking = ("c1", qs)
+    a.ingest(r, publish=True)
+    assert r.asking is None
+
+
+def test_limits_are_asked_for_not_only_read_from_replies(tmp_path: Path) -> None:
+    """The weekly window reset early; rollouts said 76% until Codex next replied."""
+    import time as _time
+
+    reset = int(_time.time()) + 3600
+    a = CodexAdapter(Registry(Bus()), root=tmp_path, exe="/usr/bin/false")
+    old = {"limit_id": "codex", "primary": {"used_percent": 76.0, "window_minutes": 10080,
+           "resets_at": reset}}  # fmt: skip
+    r = Rollout(path=tmp_path / "r.jsonl", tid="t1")
+    r.limits["codex"] = (datetime(2026, 10, 17, tzinfo=UTC), old)
+    a.rollouts["t1"] = r
+
+    class Server:
+        async def request(self, method: str, params: object) -> dict[str, object]:
+            assert method == "account/rateLimits/read"
+            w = {"usedPercent": 0, "windowDurationMins": 10080, "resetsAt": reset}
+            return {"rateLimitsByLimitId": {"codex": {"planType": "plus", "primary": w}}}
+
+    async def server() -> Server:
+        return Server()
+
+    a.ensure_server = server  # type: ignore[assignment,method-assign]
+    asyncio.run(a.read_limits())
+    lim = a.limits()
+    assert lim and lim["plan"] == "plus" and lim["windows"][0]["used_percent"] == 0

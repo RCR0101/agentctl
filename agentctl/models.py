@@ -1,13 +1,13 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 Source = Literal["claude_code", "codex", "opencode"]
 Origin = Literal["cli", "desktop", "sdk", "unknown"]
 Status = Literal["working", "awaiting_approval", "awaiting_input", "idle", "ended"]
 EventKind = Literal[
-    "message", "tool_call", "tool_result", "status_change", "approval_request", "error"
+    "message", "tool_call", "tool_result", "status_change", "approval_request", "error", "notice"
 ]
 
 # Sort order for listings: what needs me first.
@@ -24,6 +24,7 @@ class ApprovalRequest(BaseModel):
     tool: str | None = None  # e.g. "Bash: touch hello.txt"
     detail: str | None = None  # native reason, e.g. "permission prompt"
     options: dict[str, str] = {}  # numbered choices read off the pane
+    questions: list[dict[str, Any]] = []  # AskUserQuestion's own, to answer as a form
 
 
 class Session(BaseModel):
@@ -33,6 +34,9 @@ class Session(BaseModel):
     cwd: str = ""
     title: str | None = None
     status: Status = "ended"
+    status_reason: str | None = None
+    status_observed_at: datetime | None = None
+    status_evidence: dict[str, Any] = Field(default_factory=dict)
     controllable: bool = False
     tmux_pane: str | None = None
     last_activity: datetime

@@ -178,6 +178,14 @@ def test_slash_and_bang_commands_read_cleanly() -> None:
     assert local_command(ok) == ("tool_result", "a.txt")  # empty stderr isn't an error
     bad = "<bash-stdout></bash-stdout><bash-stderr>no such file</bash-stderr>"
     assert local_command(bad) == ("tool_error", "no such file")
+    note = (
+        "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>"
+        'Background command "Run arms" completed (exit code 0)</summary>\n</task-notification>'
+    )
+    assert local_command(note) == (
+        "notice",
+        'Background command "Run arms" completed (exit code 0)',
+    )
     assert local_command("<b>not ours</b>") is None and local_command("plain text") is None
 
 
@@ -189,3 +197,54 @@ def test_pasted_content_unwrapped() -> None:
     typed = 'see this <pasted_content id="a1b2">\nlog line\n</pasted_content id="a1b2">\n'
     assert unwrap_pastes(typed) == "see this log line"
     assert unwrap_pastes("plain") == "plain"
+
+
+def test_ask_user_question_is_answered_like_a_person_would(
+    env: tuple[Registry, ClaudeCodeAdapter, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentctl import tmux
+
+    reg, a, root = env
+    qs = [
+        {"question": "Colour?", "multiSelect": False, "options": [{"label": c} for c in "RGB"]},
+        {"question": "Season?", "multiSelect": False, "options": [{"label": c} for c in "SUA"]},
+        {"question": "Fruit?", "multiSelect": True, "options": [{"label": c} for c in "APL"]},
+    ]
+    use = {"type": "tool_use", "id": "t1", "name": "AskUserQuestion", "input": {"questions": qs}}
+    msg = {"role": "assistant", "content": [use], "stop_reason": "tool_use"}
+    transcript(root).write_text(line(type="assistant", message=msg))
+    info = {"pid": os.getpid(), "sessionId": SID, "status": "waiting", "waitingFor": "input needed"}
+    (root / "sessions" / "1.json").write_text(json.dumps(info))
+    asyncio.run(a.discover())
+    appr = reg.sessions[SID].pending_approval
+    assert appr and appr.tool == "AskUserQuestion" and appr.questions == qs
+
+    sent: list[str] = []
+
+    async def keys(sock: object, pane: str, *k: str) -> None:
+        sent.extend(k)
+
+    async def literal(sock: object, pane: str, text: str) -> None:
+        sent.append(f"<{text}>")
+
+    async def verified(sid: str) -> tuple[str, str]:
+        return "sock", "%1"
+
+    async def nap(_: float) -> None:
+        pass
+
+    monkeypatch.setattr(tmux, "keys", keys)
+    monkeypatch.setattr(tmux, "literal", literal)
+    monkeypatch.setattr(a, "verified", verified)
+    monkeypatch.setattr(asyncio, "sleep", nap)
+    answers = [{"choices": [3]}, {"text": "late\nwinter"}, {"choices": [1, 3], "text": "mango"}]
+    chosen = asyncio.run(a.answer(SID, answers))
+    assert chosen == "B; late winter; A, L, mango"
+    assert sent == [
+        "3",  # a digit picks a single choice and moves on
+        "4", "<late winter>", "Enter",  # "Type something", typed (a newline would submit)
+        "1", "3", "4", "Down", "Down", "Down", "<mango>", "Tab", "Enter",  # ticks, then text
+        "1",  # "Submit answers" on the review tab
+    ]  # fmt: skip
+    with pytest.raises(Exception, match="pick one or type"):
+        asyncio.run(a.answer(SID, [{"choices": [1, 2]}, {"text": "x"}, {"choices": [1]}]))

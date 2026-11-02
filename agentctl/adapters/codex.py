@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from agentctl import CODEX_DIR, launcher, tmux
-from agentctl.adapters.base import ControlError
+from agentctl.adapters.base import ControlError, answer_summary, plan_answers
 from agentctl.adapters.claude_code import LIVE_GRACE, cap, first_line, parse_ts
 from agentctl.daemon.registry import Registry
 from agentctl.models import ApprovalRequest, EventKind, Origin, Session, SessionEvent, Status
@@ -27,6 +27,7 @@ from agentctl.tailer import FileTail
 log = logging.getLogger(__name__)
 
 APPROVALS = {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}
+ASK = "item/tool/requestUserInput"  # request_user_input: Codex asking you (Plan mode)
 # CommandExecutionApprovalDecision / FileChangeApprovalDecision share these four.
 DECISIONS = {
     "1": ("accept", "Yes"),
@@ -78,11 +79,11 @@ def item_events(item: dict[str, Any], sid: str, ts: datetime) -> list[SessionEve
         out.append(SessionEvent(session_id=sid, kind=k, ts=ts, payload=payload))
 
     if kind == "userMessage":
-        ev("message", role="user", text=cap(_text(item.get("content"))))
+        ev("message", role="user", text=_text(item.get("content")))
     elif kind == "agentMessage":
         text = item.get("text") or _text(item.get("content"))
         if text:
-            ev("message", role="assistant", text=cap(text))
+            ev("message", role="assistant", text=text)
     elif kind == "commandExecution":
         cmd = item.get("command")
         cmd = cmd[-1] if isinstance(cmd, list) and cmd else str(cmd or "")
@@ -127,6 +128,22 @@ class Rollout(FileTail):
     # newest token_count rate_limits per bucket ("codex", "premium", ...)
     limits: dict[str, tuple[datetime, dict[str, Any]]] = field(default_factory=dict)
     window: int | None = None
+    asking: tuple[str, list[dict[str, Any]]] | None = None  # unanswered request_user_input
+
+
+def questions(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """request_user_input's questions in AskUserQuestion's shape (one choice each)."""
+    return [
+        {
+            "id": q.get("id"),
+            "header": q.get("header"),
+            "question": q.get("question"),
+            "options": q.get("options") or [],
+            "isOther": q.get("isOther", True) or not q.get("options"),
+        }
+        for q in raw
+        if isinstance(q, dict)
+    ]
 
 
 def parse_rollout(d: dict[str, Any], r: Rollout) -> list[SessionEvent]:
@@ -138,14 +155,20 @@ def parse_rollout(d: dict[str, Any], r: Rollout) -> list[SessionEvent]:
         r.paginated = p.get("history_mode") == "paginated"
         r.originator, r.source, r.cwd = p.get("originator"), p.get("source"), p.get("cwd", "")
         return []
+    if typ == "response_item" and p.get("name") == "request_user_input":  # either file format
+        with contextlib.suppress(ValueError, TypeError, AttributeError):
+            raw = json.loads(p.get("arguments") or "{}").get("questions") or []
+            r.asking = (str(p.get("call_id")), questions(raw))
+    elif typ == "response_item" and r.asking and p.get("call_id") == r.asking[0]:
+        r.asking = None  # answered
     if typ == "event_msg":
         et = p.get("type")
         if et == "task_started":
             r.last_kind = "working"
         elif et == "task_complete":
-            r.last_kind = "done"
+            r.last_kind, r.asking = "done", None
         elif et == "turn_aborted":
-            r.last_kind = "interrupted"
+            r.last_kind, r.asking = "interrupted", None
         elif et == "token_count" and isinstance(p.get("info"), dict):
             info = p["info"]
             r.context = (info.get("last_token_usage") or {}).get("input_tokens", r.context)
@@ -168,7 +191,7 @@ def parse_rollout(d: dict[str, Any], r: Rollout) -> list[SessionEvent]:
                     session_id=r.tid,
                     kind="message",
                     ts=ts,
-                    payload={"role": role, "text": cap(str(p.get("message", "")))},
+                    payload={"role": role, "text": str(p.get("message", ""))},
                 )
             ]
         return []
@@ -291,6 +314,7 @@ class CodexAdapter:
         self.not_in_tmux: set[int] = set()  # holder pids already checked (e.g. the desktop app)
         self.thread_panes: dict[str, tuple[str | None, str]] = {}
         self.tui_prompt: dict[str, dict[str, str]] = {}  # thread -> menu showing in its TUI pane
+        self.asked: dict[str, tuple[datetime, dict[str, Any]]] = {}  # account/rateLimits/read
 
     # --- lifecycle ---
 
@@ -327,6 +351,9 @@ class CodexAdapter:
                     await self.scan_tui_prompts()
                     if set(self.holders) - set(self.reg.sessions):  # a thread we haven't seen
                         last_refresh = 0
+                if n % 60 == 0:
+                    with contextlib.suppress(CodexError, ControlError, OSError, TimeoutError):
+                        await self.read_limits()
                 if time.monotonic() - last_refresh > REFRESH_SECS:
                     last_refresh = time.monotonic()
                     with contextlib.suppress(CodexError, ControlError, OSError, TimeoutError):
@@ -499,14 +526,29 @@ class CodexAdapter:
             else:
                 self.not_in_tmux.add(pid)
 
+    async def read_limits(self) -> None:
+        """Ask Codex for the plan's limits (no tokens). Rollouts only report them when Codex
+        replies, so a reset, even an early one, used to show only after the next reply."""
+        res = await (await self.ensure_server()).request("account/rateLimits/read", {})
+        now = datetime.now(UTC)
+        for bucket, rl in (res.get("rateLimitsByLimitId") or {}).items():
+            wins = {
+                key: {"used_percent": w.get("usedPercent"), "window_minutes":
+                      w.get("windowDurationMins"), "resets_at": w.get("resetsAt")}
+                for key in ("primary", "secondary")
+                if isinstance(w := rl.get(key), dict)
+            }  # fmt: skip
+            if wins:  # the rollouts' shape
+                self.asked[bucket] = (now, {"plan_type": rl.get("planType"), **wins})
+
     def limits(self) -> dict[str, Any] | None:
         """Your Codex plan's usage windows: the newest report of each limit bucket ("codex" is
         the main one; others are prefixed, e.g. "premium 5h"):
         {"plan", "at", "windows": [{"name", "used_percent", "resets_at"}]}. A window whose
         reset time has passed is reported as 0% used."""
         newest: dict[str, tuple[datetime, dict[str, Any]]] = {}
-        for r in self.rollouts.values():
-            for bucket, (ts, rl) in r.limits.items():
+        for lims in [*(r.limits for r in self.rollouts.values()), self.asked]:
+            for bucket, (ts, rl) in lims.items():
                 if bucket not in newest or ts > newest[bucket][0]:
                     newest[bucket] = (ts, rl)
         if not newest:
@@ -546,23 +588,44 @@ class CodexAdapter:
         s.controllable = bool(self.exe) and (pane is not None or tid not in self.holders)
         last = LAST_STATUS.get(r.last_kind if r else None, "awaiting_input")
         st = (loaded or {}).get("status") or {}
-        if tid in self.pending or tid in self.tui_prompt:
+        asking = r.asking[1] if r and r.asking and tid not in self.pending else None
+        if tid in self.pending or tid in self.tui_prompt or asking:
+            reason = "approval_prompt_observed"
             status: Status = "awaiting_approval"
         elif st.get("type") == "active":
+            reason = "app_server_active"
             flags = st.get("activeFlags") or []
             status = "awaiting_approval" if "waitingOnApproval" in flags else "working"
             status = "awaiting_input" if "waitingOnUserInput" in flags else status
         elif st.get("type") == "idle":
+            reason = "app_server_idle"
             status = "awaiting_input"
         elif tid in self.holders:  # open in the desktop app or a TUI
+            reason = "process_holder_observed"
             status = last
         elif r and time.time() - r.mtime < LIVE_GRACE.total_seconds():
+            reason = "recent_transcript_inference"
             status = last
         else:
+            reason = "no_recent_live_evidence_inferred_ended"
             status = "ended"
         if status != "awaiting_approval":
             s.pending_approval = None
-        self.reg.set_status(tid, status)
+        elif asking:  # in its TUI (or the desktop app): read from the rollout
+            s.pending_approval = ApprovalRequest(tool="request_user_input", questions=asking)
+        self.reg.set_status(
+            tid,
+            status,
+            reason,
+            {
+                "holder_pid": self.holders.get(tid),
+                "pane": s.tmux_pane,
+                "app_server_status": st,
+                "transcript_mtime": r.mtime if r else None,
+                "last_kind": r.last_kind if r else None,
+                "process_exit_confirmed": False,
+            },
+        )
 
     # --- app-server messages ---
 
@@ -613,11 +676,16 @@ class CodexAdapter:
             tool = f"shell: {p.get('command') or '?'}"
         elif method == "item/fileChange/requestApproval":
             tool = f"edit: {p.get('reason') or p.get('grantRoot') or 'file changes'}"
+        elif method == ASK:
+            tool = "request_user_input"
         else:
             tool = f"{method} (answer it in Codex; agentctl can only deny it)"
         opts = {k: v[1] for k, v in DECISIONS.items()} if method in APPROVALS else {}
         s.pending_approval = ApprovalRequest(
-            tool=cap(tool, 300), detail=p.get("reason"), options=opts
+            tool=cap(tool, 300),
+            detail=p.get("reason"),
+            options=opts,
+            questions=questions(p.get("questions") or []) if method == ASK else [],
         )
         self.sync(tid)
         self.reg.add_event(
@@ -734,6 +802,43 @@ class CodexAdapter:
             s.pending_approval = None
         self.sync(tid)
         return f"{key}. {opts[key]}"
+
+    async def answer(self, session_id: str, answers: list[dict[str, Any]]) -> str:
+        """Answer request_user_input: a reply to our app-server's request, or, in a Codex TUI,
+        its form: one question at a time, a digit picks (and moves on; on the last, submits
+        all); a typed answer is "None of the above" plus a note (tab). Measured on 0.162."""
+        tid = session_id
+        s = self.reg.sessions[tid]
+        appr = s.pending_approval if s.status == "awaiting_approval" else None
+        qs = appr.questions if appr else []
+        if not qs:
+            raise ControlError("thread isn't asking a question")
+        plan = plan_answers(qs, answers)
+        req = self.pending.get(tid)
+        if req and req["method"] == ASK and self.server:
+            self.server.respond(req["id"], {"answers": {
+                q["id"]: {"answers": [typed] if typed else [q["options"][picks[0] - 1]["label"]]}
+                for q, (_, picks, typed) in zip(qs, plan, strict=True)
+            }})  # fmt: skip
+            del self.pending[tid]
+        else:
+            sock, pane = await self.verified(tid)
+            for n, picks, typed in plan:
+                if not typed:
+                    await tmux.keys(sock, pane, str(picks[0]))
+                else:
+                    for k in ["Down"] * n + ["Tab"] * bool(n):  # to "None of the above"; notes
+                        await tmux.keys(sock, pane, k)
+                        await asyncio.sleep(0.2)
+                    await tmux.literal(sock, pane, typed)
+                    await asyncio.sleep(0.2)
+                    await tmux.keys(sock, pane, "Enter")
+                await asyncio.sleep(0.4)  # the next question renders
+        r = self.rollouts.get(tid)
+        if r:
+            r.asking = None
+        self.sync(tid)
+        return answer_summary(qs, plan)
 
     async def interrupt(self, session_id: str) -> None:
         tid = session_id
