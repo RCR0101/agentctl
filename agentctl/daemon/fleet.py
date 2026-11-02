@@ -10,11 +10,13 @@ from functools import lru_cache
 from pathlib import Path
 
 from agentctl.models import STATUS_ORDER, Session, SessionEvent, short_id
+from agentctl.waiting import STUCK_MINUTES
 
 # Tool names that change files, across Claude (Edit, Write, ...), Codex (edit, apply_patch)
 # and opencode (edit, write, patch). Their summary is the path (Codex: "a, b").
 EDIT_TOOLS = {"edit", "write", "multiedit", "notebookedit", "apply_patch", "patch"}
 BUSY = ("working", "awaiting_approval")
+STUCK_SECONDS = STUCK_MINUTES * 60
 CONFLICT_WINDOW = timedelta(hours=2)  # edits older than this don't count as overlapping
 
 
@@ -232,7 +234,7 @@ def digest(
 ) -> list[dict[str, object]]:
     """One entry per session with replies you haven't seen: what it finished, which files it
     touched, and the start of its last reply. Sessions needing you come first."""
-    rows: list[tuple[tuple[int, float], dict[str, object]]] = []
+    rows: list[tuple[tuple[float, float], dict[str, object]]] = []
     for s in sessions:
         evs = events.get(s.id, [])
         since = seen.get(s.id, default_seen)
@@ -241,7 +243,20 @@ def digest(
             continue
         replies = [e for e in evs if e.kind == "message" and e.payload.get("role") == "assistant"]
         last = str(replies[-1].payload.get("text", "")).strip() if replies else ""
-        order = (STATUS_ORDER[s.status], -s.last_activity.timestamp())
+        new = [e for e in evs if e.ts > since]
+        failed = sum(1 for e in new if e.kind == "tool_result" and e.payload.get("is_error"))
+        errors = [
+            (str(e.payload.get("text", "")).strip().splitlines() or [""])[0][:200]
+            for e in new
+            if e.kind == "error"
+        ]
+        quiet = (datetime.now(UTC) - s.last_activity).total_seconds()
+        stuck = s.status == "working" and quiet > STUCK_SECONDS
+        # what needs you, then what went wrong, then the rest by status
+        rank = float(STATUS_ORDER[s.status])
+        if rank > STATUS_ORDER["awaiting_input"] and (stuck or errors):
+            rank = STATUS_ORDER["awaiting_input"] + 0.5
+        order = (rank, -s.last_activity.timestamp())
         row: dict[str, object] = {
             "id": s.id,
             "title": s.title,
@@ -249,6 +264,9 @@ def digest(
             "new_replies": n,
             "files": sorted(Path(f).name for f in edited_files(evs, s.cwd, since)),
             "last_reply": last.splitlines()[0][:200] if last else "",
+            "errors": errors[-3:],
+            "failed_tools": failed,
+            "stuck_minutes": int(quiet // 60) if stuck else None,
         }
         rows.append((order, row))
     return [row for _, row in sorted(rows, key=lambda x: x[0])]

@@ -74,9 +74,30 @@ def test_unread_and_digest(tmp_path: Path) -> None:
             "new_replies": 1,
             "files": ["app.py"],
             "last_reply": "Fixed the bug.",
+            "errors": [],
+            "failed_tools": 0,
+            "stuck_minutes": None,
         }
     ]
     assert fleet.digest([s], {"aaaa1111": evs}, {"aaaa1111": NOW}, seen) == []
+
+
+def test_digest_reports_errors_and_puts_them_after_what_needs_you() -> None:
+    ok = sess("aaaa1111", "/a", status="idle")
+    bad = sess("bbbb2222", "/b", status="idle")
+    asks = sess("cccc3333", "/c", status="awaiting_input")
+    evs = {
+        "aaaa1111": [ev("aaaa1111", "message", ago=1, role="assistant", text="done")],
+        "bbbb2222": [
+            ev("bbbb2222", "tool_result", ago=3, text="boom", is_error=True),
+            ev("bbbb2222", "error", ago=2, text="API error: overloaded\nretrying"),
+            ev("bbbb2222", "message", ago=1, role="assistant", text="gave up"),
+        ],
+        "cccc3333": [ev("cccc3333", "message", ago=1, role="assistant", text="which one?")],
+    }
+    rows = fleet.digest([ok, bad, asks], evs, {}, NOW - timedelta(minutes=10))
+    assert [r["id"] for r in rows] == ["cccc3333", "bbbb2222", "aaaa1111"]
+    assert rows[1]["errors"] == ["API error: overloaded"] and rows[1]["failed_tools"] == 1
 
 
 def test_queued_follow_up_waits_for_the_agent() -> None:

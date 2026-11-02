@@ -8,6 +8,16 @@ The dashboard works down to about 45 columns, so a phone in portrait is fine.
 It's local only: a background daemon talks to a Unix socket that only your user can open. It
 has no network listener, no cloud and no telemetry. Remote access is plain SSH.
 
+**Quick start**, once installed (below):
+
+```sh
+claude                          # start agents as usual (setup aliases them into agentctl)
+agentctl                        # what needs you right now, and what to type next
+agentctl watch                  # the live dashboard; ? lists its keys
+agentctl approve @              # answer the prompt that's waiting on you
+agentctl send api "run the tests" -w   # reply to the session in ~/…/api, wait for its answer
+```
+
 ## Install
 
 You need macOS, [uv](https://docs.astral.sh/uv/) and tmux, plus at least one of `claude`,
@@ -64,12 +74,17 @@ Start agents as usual: `claude`, `codex`, `opencode` (with the aliases), or
 `agentctl new claude ~/proj` to start one in the background. Then, from anywhere:
 
 ```sh
+agentctl                       # summary: what needs you, what's running, unread replies
 agentctl watch                 # dashboard (phone friendly)
-agentctl ls                    # sessions, what needs you first
+agentctl ls                    # sessions, what needs you first (-m: only those)
+agentctl ls --here -w          # just this repo's sessions, kept up to date
 agentctl tail <id> -f          # follow a transcript
-agentctl send <id> "do X"      # reply ("-" reads stdin)
+agentctl send <id> "do X"      # reply ("-" reads stdin); -w waits for the answer
+agentctl wait <id>             # block until its turn ends, print the reply
 agentctl approve <id>          # option 1; --choice N for another
+agentctl approve --all --tool 'Read*'   # every matching prompt, after showing you the list
 agentctl deny <id>
+agentctl rules                 # approval rules that answer prompts for you (below)
 agentctl interrupt <id>
 agentctl attach <id>           # open the session's terminal; Ctrl-] d to leave
 agentctl send <id> -l "then run the tests"   # queued: sent once it's free
@@ -79,7 +94,41 @@ agentctl rename <id> "name"    # your own name for it
 agentctl close <id>            # quit the agent (resumable with adopt)
 ```
 
-Ids are 8-character prefixes as shown by `ls`.
+A session can be named by an id prefix as shown by `ls`, by its name (yours from `rename`,
+or the agent's title), its folder, or a word in its name: `agentctl send api "run the
+tests"`. `@` is the session waiting on you, most urgent first: `agentctl approve @`. If a name
+matches several live sessions, agentctl asks which one on a terminal (scripts get an error
+listing them); an id prefix must be unique. Tab completes ids and names once you run
+`agentctl --install-completion`.
+
+`agentctl wait` exits 0 when the turn finished, 2 if it stopped for approval, 3 on timeout,
+4 if nothing was running and 5 if a delivery is uncertain, so scripts can chain agents:
+`agentctl send api "add the endpoint" -w > api.md && agentctl send web "$(cat api.md)"`.
+`ls` and the summary also flag a working session that has been quiet for 10 minutes ("quiet
+14m") and one that has used 80% of its context window, with what to do about each. `digest`
+lists the errors and failed tool calls since you last looked, and puts those sessions right
+after the ones waiting on you.
+
+### Approval rules
+
+Rules answer matching permission prompts for you, in sessions agentctl controls:
+
+```sh
+agentctl rules add "allow Read*"
+agentctl rules add "allow Bash: npm test*" --in ~/src/api
+agentctl rules add "deny Bash: rm -rf *"
+agentctl rules                 # the list, numbered; rules rm N removes one
+agentctl rules test "Bash: npm test" --in ~/src/api   # which rule would answer it
+```
+
+A pattern is a glob matched, ignoring case, against the request as `ls` shows it. Deny rules
+win over allow rules, and `allow *` is refused. Questions (AskUserQuestion forms) are never
+answered by a rule. Each automatic answer is noted in that session's transcript.
+Rules are kept in the daemon's state and changed only through `agentctl rules`; the daemon
+refuses rule changes and `approve --all` from agents, so an agent can't use agentctl to approve
+its own prompts. Like the rest of agentctl's agent policy, this doesn't sandbox an agent's
+shell, which runs as you. Rules also answer prompts in a team's worker sessions: a rule is
+your decision, made ahead of time. Keep allow rules narrow.
 
 ### The dashboard (`agentctl watch`)
 
@@ -127,6 +176,7 @@ On the session list, Esc clears an applied filter. `Ctrl+Q` always exits the das
 | `Ctrl+T` | open its terminal; `Ctrl-] d` returns |
 | `Ctrl+P` | search available commands |
 | `g` | go to a session needing approval |
+| `Ctrl+G` | teams |
 | `w` | review the latest observed request, full reply, recorded tool outputs, tool-edited files and current Git changes. Git changes include all sessions and manual edits; recorded tool outcomes are shown without inferring whether the task succeeded |
 | `v` | show or hide project files (a separate page on a phone) |
 | `s` | send a message. Quick replies sit under the box: tap one to put it in, then Enter. Edit them in `~/.agentctl/replies`, one per line |
@@ -140,7 +190,7 @@ On the session list, Esc clears an applied filter. `Ctrl+Q` always exits the das
 | `p` | group the list by project (git repo) instead of by status |
 | `l` | queue a message, sent once the agent is free |
 | `o` | adopt a read-only session (moves it into agentctl) |
-| `x` | hide a session; its agent keeps running (`z` unhides) |
+| `x` / `z` | hide a session (its agent keeps running) / bring it back |
 | `Ctrl+X` | quit and hide an idle session; `z` only unhides, `o` resumes |
 | `/` | filter the list by id, title or folder |
 | `f` | search what was said in every session (your messages and the replies, not tool output); Enter on a match opens its session |
@@ -151,7 +201,8 @@ On the session list, Esc clears an applied filter. `Ctrl+Q` always exits the das
 | `b` | bell and a Mac notification with the alerts below |
 | `t` | theme, previewed as you move through the list; the pick is remembered |
 | `?` | all keys |
-| `q` | quit |
+| `Ctrl+R` | reload everything (it also reconnects by itself) |
+| `q` / `Ctrl+Q` | quit; `Ctrl+Q` works from anywhere, even mid-reply |
 
 While attached to any agent in agentctl's tmux, `Ctrl-] w` opens this dashboard over it, and
 `q` goes back.
@@ -165,6 +216,9 @@ first letter.
 - a turn that ran 2 minutes or more finished;
 - a Claude session waiting on you has under 2 minutes of prompt cache left, so replying
   before then avoids rebuilding the cache;
+- a working session has gone 10 minutes without output (it may be stuck);
+- a session has used 80% of its context window (for Claude, `/compact` then leads its quick
+  replies);
 - a message you sent hasn't shown up in the session's transcript 30 s after the agent was
   free to take it (a short "has your message" toast confirms the ones that arrive).
 
@@ -266,15 +320,15 @@ Example: "Start a Codex session in ~/api with the migration task, wait for it, t
 frontend session the new endpoint."
 
 **What it never does:**
-- **Answer another agent's prompts.** Approve, deny, close and adopt aren't available to
-  agents. A send is refused while the target has a permission or trust menu on screen, so
+- **Answer another agent's prompts.** Approve, deny, close, adopt, approval rules and
+  cancelling queued messages aren't available to agents. A send is refused while the target has a permission or trust menu on screen, so
   typed text can't answer it.
 - **Pass arbitrary flags.** `start_session` takes a model name, never flags.
 - **Treat transcripts as instructions.** Other agents' transcripts are returned as data.
 
 ## Teams: one coordinator, several sessions
 
-Run `agentctl teams`, press `g` in the dashboard, or choose **Teams** from Ctrl+P.
+Run `agentctl teams`, press `Ctrl+G` in the dashboard, or choose **Teams** from Ctrl+P.
 Create a team with a goal and coordinator session, then use **Connect worker** to add
 sessions. The interactive graph shows each role, connection permission, and session state.
 Select a node to edit its scope, rebind it, read its transcript, reply, or open its terminal.

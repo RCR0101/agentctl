@@ -3,13 +3,26 @@ import sqlite3
 from collections import deque
 from copy import deepcopy
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from agentctl.daemon.bus import Bus
-from agentctl.models import STATUS_ORDER, Session, SessionEvent, Status
+from agentctl.models import STATUS_ORDER, Session, SessionEvent, Status, short_id
 
 # ponytail: in-memory ring of recent events per session; tail -n beyond this needs a file read.
 EVENTS_PER_SESSION = 500
+
+
+def _folder(cwd: str) -> str:
+    return Path(cwd).name.casefold() if cwd else ""
+
+
+class AmbiguousRef(KeyError):
+    """Several sessions match; `choices` lets a client offer a pick instead of an error."""
+
+    def __init__(self, message: str, choices: list[dict[str, str]]) -> None:
+        super().__init__(message)
+        self.choices = choices
 
 
 class Registry:
@@ -17,6 +30,7 @@ class Registry:
         self.bus = bus
         self.sessions: dict[str, Session] = {}
         self.events: dict[str, deque[SessionEvent]] = {}
+        self.names: dict[str, str] = {}  # agentctl's own names (`rename`), by session id
 
     def upsert(self, s: Session) -> Session:
         return self.sessions.setdefault(s.id, s)
@@ -65,16 +79,49 @@ class Registry:
         self.sessions.pop(sid, None)
         self.events.pop(sid, None)
 
-    def resolve(self, prefix: str) -> Session:
-        if prefix in self.sessions:
-            return self.sessions[prefix]
-        hits = [s for sid, s in self.sessions.items() if sid.startswith((prefix, f"ses_{prefix}"))]
-        if not hits:
-            raise KeyError(f"no session matches {prefix!r}")
-        if len(hits) > 1:
-            ids = ", ".join(sorted(s.id[:12] for s in hits))
-            raise KeyError(f"ambiguous id {prefix!r}: {ids}")
-        return hits[0]
+    def resolve(self, ref: str) -> Session:
+        """The session someone means. In order: an exact id; `@`, the session that most needs
+        you; an exact name (yours from `rename`, or the agent's title); an id prefix; a folder
+        name; a word in the name. For names and folders, a single live session wins over ended
+        ones; an id prefix must be unique."""
+        if ref in self.sessions:
+            return self.sessions[ref]
+        if ref == "@":
+            for s in self.listing():
+                if s.status in ("awaiting_approval", "awaiting_input"):
+                    return s
+            raise KeyError("no session is waiting for you")
+        want = ref.strip().casefold()
+        if not want:
+            raise KeyError("no session id or name given")
+        named = [
+            (s, (self.names.get(s.id) or s.title or "").casefold()) for s in self.sessions.values()
+        ]
+        steps: list[tuple[bool, list[Session]]] = [
+            (True, [s for s, n in named if n == want]),
+            (False, [s for s in self.sessions.values() if s.id.startswith((ref, f"ses_{ref}"))]),
+            (True, [s for s in self.sessions.values() if _folder(s.cwd) == want]),
+            (True, [s for s, n in named if len(want) >= 3 and want in n]),
+        ]
+        for prefer_live, hits in steps:
+            live = [s for s in hits if s.status != "ended"] if prefer_live else hits
+            if len(hits) == 1 or len(live) == 1:
+                return (live if len(live) == 1 else hits)[0]
+            if hits:
+                choices = sorted(live or hits, key=lambda s: -s.last_activity.timestamp())
+                shown = ", ".join(f"{short_id(s.id)} ({self.label(s)})" for s in choices[:6])
+                more = f" and {len(choices) - 6} more" if len(choices) > 6 else ""
+                raise AmbiguousRef(
+                    f"ambiguous {ref!r}: {shown}{more}; type more of an id",
+                    [
+                        {"id": s.id, "label": self.label(s), "status": s.status, "cwd": s.cwd}
+                        for s in choices[:20]
+                    ],
+                )
+        raise KeyError(f"no session matches {ref!r} (by id, name or folder)")
+
+    def label(self, s: Session) -> str:
+        return self.names.get(s.id) or s.title or _folder(s.cwd) or s.id
 
     def listing(self) -> list[Session]:
         return sorted(

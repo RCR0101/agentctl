@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from agentctl import mcp
+from agentctl import mcp, waiting
 
 NOW = datetime.now(UTC)
 
@@ -74,7 +74,7 @@ def test_transcripts_are_labelled_untrusted() -> None:
 
 
 def test_wait_for_returns_the_reply_once_done(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(mcp.time, "sleep", lambda s: None)
+    monkeypatch.setattr(waiting.time, "sleep", lambda s: None)
     states = iter(["working", "working", "awaiting_input"])
     reply = {"kind": "message", "ts": NOW.isoformat(),
              "payload": {"role": "assistant", "text": "Endpoint is POST /v2/orders"}}  # fmt: skip

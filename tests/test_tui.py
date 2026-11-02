@@ -748,6 +748,32 @@ def test_long_turn_and_cache_alerts() -> None:
     asyncio.run(run())
 
 
+def test_stuck_and_context_alerts_fire_once() -> None:
+    fake = Fake()
+
+    async def run() -> None:
+        app = fake.watch()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            said: list[str] = []
+            app.notify = lambda msg, **kw: said.append(msg)  # type: ignore[assignment,method-assign,misc]
+            quiet = (datetime.now(UTC) - timedelta(minutes=12)).isoformat()
+            stuck = row("aaaa1111", "working") | {"last_activity": quiet}
+            app.announce([stuck])
+            app.announce([stuck])  # once per silence, not every poll
+            assert len(said) == 1 and "no output for 12 min" in said[0]
+            said.clear()
+            full = row("bbbb2222", "idle") | {"context_tokens": 180_000, "context_window": 200_000}
+            app.announce([full])
+            app.announce([full])
+            assert len(said) == 1 and "90% of its context" in said[0] and "/compact" in said[0]
+            app.announce([full | {"context_tokens": 20_000}])  # compacted: re-arms
+            app.announce([full])
+            assert len(said) == 2
+
+    asyncio.run(run())
+
+
 def test_list_keeps_refreshing_after_a_stuck_poll(monkeypatch: Any) -> None:
     import agentctl.tui as tui
 

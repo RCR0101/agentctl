@@ -26,7 +26,8 @@ from agentctl.daemon import fleet, search
 from agentctl.daemon.agent_chats import AgentChats, identify_agent
 from agentctl.daemon.bus import Bus
 from agentctl.daemon.history import CommandHistory
-from agentctl.daemon.registry import Registry, Store
+from agentctl.daemon.registry import AmbiguousRef, Registry, Store
+from agentctl.daemon.rules import Rule, Rules, decide
 from agentctl.daemon.teams import Teams
 from agentctl.models import Session, SessionEvent, short_id
 
@@ -52,6 +53,28 @@ def peer_pid(fd: int) -> int:
 
 class RpcError(Exception):
     pass
+
+
+# Who may call what. The daemon checks the caller's process tree for the methods in
+# CALLER_CHECKED; a call from inside an agent is marked `_actor="agent"` and may only use
+# AGENT_METHODS (its send/queue become fresh agent chats). Everything a human must decide
+# (approving, denying, answering, interrupting, closing, cancelling queued work) is checked
+# and kept out of AGENT_METHODS. Team methods (`team_*`, `teams_list`) are always checked and
+# authorised by their own scoped credentials.
+CALLER_CHECKED = frozenset({
+    "send", "queue", "unqueue", "launch", "keys", "approve", "approve_all", "answer",
+    "interrupt", "close", "pane", "rules",
+})  # fmt: skip
+AGENT_METHODS = frozenset({
+    "ls", "tail", "screen", "history", "digest", "search", "edited", "file_activity", "usage",
+    "ping", "send", "queue", "launch",
+})  # fmt: skip
+# A human using these on a session takes it over from its team (future team sends wait).
+TAKEOVER_METHODS = frozenset({"send", "queue", "keys", "pane", "interrupt", "close"})
+
+
+def caller_checked(method: str) -> bool:
+    return method in CALLER_CHECKED or method.startswith("team_") or method == "teams_list"
 
 
 # Text on screen meaning a menu is waiting for an answer (permission, trust, confirm). Typed
@@ -82,6 +105,7 @@ class Server:
         self.agent_chats = AgentChats(store)
         self.teams = Teams(registry, self.history, store)
         self.titles = store.titles() if store else {}
+        registry.names = self.titles  # the same dict: renames are seen by resolve()
         seen = store.seen() if store else {}
         if "*" not in seen:  # first run with unread tracking: older replies count as seen
             seen["*"] = time.time()
@@ -107,6 +131,8 @@ class Server:
         self.armed: dict[str, bool] = {}  # may the next follow-up go out yet?
         self.queue_error: dict[str, str] = {}
         self.index = search.Index()
+        self.rules = Rules(store)
+        self.ruled: dict[str, str] = {}  # session -> request a rule already looked at
         self.reg = registry
         self.claude = claude
         self.codex = codex
@@ -135,25 +161,7 @@ class Server:
                 try:
                     req = json.loads(line)
                     method, params = req["method"], req.get("params") or {}
-                    if (
-                        method
-                        in (
-                            "send",
-                            "queue",
-                            "launch",
-                            "keys",
-                            "approve",
-                            "answer",
-                            "interrupt",
-                            "close",
-                            "pane",
-                            "team_assign",
-                            "team_assignment_review",
-                            "team_release",
-                        )
-                        or method.startswith("team_")
-                        or method == "teams_list"
-                    ):
+                    if caller_checked(method):
                         holders = {
                             holder
                             for s in self.reg.sessions.values()
@@ -187,6 +195,8 @@ class Server:
                     raise  # the client hung up (e.g. Ctrl-C on `tail -f`): not an error
                 except (RpcError, ControlError, launcher.LaunchError, KeyError, ValueError) as e:
                     reply = {"id": req.get("id"), "error": {"message": str(e).strip("'\"")}}
+                    if isinstance(e, AmbiguousRef):
+                        reply["error"]["choices"] = e.choices
                     if req.get("method") in ("send", "queue", "approve"):  # trace, never the text
                         sid = str((req.get("params") or {}).get("id", ""))[:8]
                         log.info("%s %s refused: %s", req["method"], sid, reply["error"]["message"])
@@ -213,22 +223,7 @@ class Server:
         if p.get("_actor") == "agent":
             if method == "launch":
                 return await self.agent_request("agent_launch", p)
-            allowed = {
-                "ls",
-                "tail",
-                "screen",
-                "history",
-                "digest",
-                "search",
-                "edited",
-                "file_activity",
-                "usage",
-                "ping",
-                "send",
-                "queue",
-                "launch",
-            }
-            if method not in allowed and not p.get("team_token"):
+            if method not in AGENT_METHODS and not p.get("team_token"):
                 raise RpcError("This control is reserved for the human; use scoped team tools")
             if method in ("send", "queue"):
                 sid = self.reg.resolve(self.aliases.get(p["id"], p["id"])).id
@@ -240,7 +235,7 @@ class Server:
         if p.get("id") in self.aliases:
             p = p | {"id": self.aliases[p["id"]]}
         if (
-            method in ("send", "queue", "keys", "pane", "interrupt", "close")
+            method in TAKEOVER_METHODS
             and not p.get("_team_dispatch")
             and p.get("_actor") != "agent"
         ):
@@ -583,6 +578,10 @@ class Server:
                 return {"session_id": s.id}
             sock, pane = await ad.verified(s.id)
             return {"session_id": s.id, "socket": sock, "pane": pane}
+        if method == "rules":
+            return self.rules.rpc(p)
+        if method == "approve_all":
+            return await self.approve_all(p)
         if method == "ping":
             return {
                 "pid": os.getpid(),
@@ -703,6 +702,71 @@ class Server:
             self.queue_error.pop(sid, None)
         if self.store:
             self.store.set_queued(sid, items)
+
+    async def apply_rules(self) -> None:
+        """Answer permission prompts your approval rules cover, once per request."""
+        while True:
+            await asyncio.sleep(1)
+            await self.rules_tick()
+
+    async def rules_tick(self) -> None:
+        for s in list(self.reg.sessions.values()):
+            appr = s.pending_approval if s.status == "awaiting_approval" else None
+            if appr is None:
+                self.ruled.pop(s.id, None)
+                continue
+            tool = appr.tool or ""
+            # one look per request; questions and sessions you can't control are always yours
+            if not tool or appr.questions or not s.controllable or self.ruled.get(s.id) == tool:
+                continue
+            self.ruled[s.id] = tool
+            rule = decide(self.rules.rules, tool, s.cwd)
+            if rule is None:
+                continue
+            allow = rule.action == "allow"
+            try:
+                chosen = await self.adapters[s.source].approve(s.id, None, allow)
+            except (ControlError, KeyError, ValueError) as e:
+                log.warning("rule %r matched %s but couldn't answer: %s", str(rule), s.id[:8], e)
+                self.notice(s.id, f"rule `{rule}` matched {tool} but couldn't answer it: {e}")
+                continue
+            log.info("rule %r answered %s: %s", str(rule), s.id[:8], chosen)
+            verb = "approved" if allow else "denied"
+            self.notice(s.id, f"auto-{verb} {tool} ({chosen}) by rule `{rule}`")
+
+    def notice(self, sid: str, text: str) -> None:
+        self.reg.add_event(
+            SessionEvent(
+                session_id=sid, kind="notice", ts=datetime.now(UTC), payload={"text": text}
+            )
+        )
+
+    async def approve_all(self, p: dict[str, Any]) -> dict[str, Any]:
+        """Approve (or deny) every pending request matching a pattern, across sessions. With
+        `only`, just those (session, request) pairs, as previewed, if they're still pending."""
+        pattern = str(p.get("tool") or "").strip()
+        if not pattern:
+            raise RpcError("say which requests: e.g. --tool 'Read*' (or --tool '*' for all)")
+        only = {(o["id"], o["tool"]) for o in p.get("only") or []}
+        allow = bool(p.get("allow", True))
+        rule = Rule("allow" if allow else "deny", pattern, p.get("folder"))
+        out = []
+        for s in self.reg.listing():
+            appr = s.pending_approval if s.status == "awaiting_approval" else None
+            if appr is None or appr.questions or not appr.tool:
+                continue
+            if not rule.matches(appr.tool, s.cwd) or (only and (s.id, appr.tool) not in only):
+                continue
+            row: dict[str, Any] = {"session_id": s.id, "tool": appr.tool, "cwd": s.cwd}
+            if not s.controllable:
+                row["error"] = "read-only: adopt it first"
+            elif not p.get("dry_run"):
+                try:
+                    row["chosen"] = await self.adapters[s.source].approve(s.id, None, allow)
+                except (ControlError, KeyError, ValueError) as e:
+                    row["error"] = str(e)
+            out.append(row)
+        return {"matched": out}
 
     async def deliver_queued(self) -> None:
         """Send each queued follow-up once its agent is free: waiting for input, or idle.
@@ -991,6 +1055,7 @@ async def main(debug: bool = False) -> None:
     ]
     watchers.append(asyncio.create_task(supervise("placeholders", srv.sweep_placeholders)))
     watchers.append(asyncio.create_task(supervise("queue", srv.deliver_queued)))
+    watchers.append(asyncio.create_task(supervise("rules", srv.apply_rules)))
     watchers.append(
         asyncio.create_task(supervise("teams", lambda: srv.teams.watch(srv.dispatch, srv.queued)))
     )

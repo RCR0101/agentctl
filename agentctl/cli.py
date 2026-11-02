@@ -28,20 +28,60 @@ from agentctl import HOME, LOG_DIR, SOCKET_PATH, hooks, launcher
 from agentctl.models import short_id
 from agentctl.setup import LABEL, PLIST
 from agentctl.teams_cli import app as teams_app
+from agentctl.waiting import EXIT, context_full, stuck_minutes, wait_turn
 
-app = typer.Typer(no_args_is_help=True, add_completion=False, rich_markup_mode="rich")
+app = typer.Typer(add_completion=True, rich_markup_mode="rich")
 daemon_app = typer.Typer(no_args_is_help=True, help="Manage the agentctld background daemon.")
 hooks_app = typer.Typer(no_args_is_help=True, help="Manage Claude Code hooks in settings.json.")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(hooks_app, name="hooks")
 app.add_typer(teams_app, name="teams")
+rules_app = typer.Typer(
+    invoke_without_command=True,
+    help="Approval rules: answer matching permission prompts for you.",
+)
+app.add_typer(rules_app, name="rules")
 out = Console(highlight=False)
 err = Console(stderr=True, highlight=False)
 
+
+def complete_session(incomplete: str) -> list[tuple[str, str]]:
+    """Shell completion: session ids (with their names as the description) and names. Never
+    starts the daemon, and stays quiet if it's down."""
+    try:
+        rows = call("ls", autostart=False)
+    except (DaemonError, OSError, ValueError):
+        return []
+    want = incomplete.casefold()
+    out: list[tuple[str, str]] = []
+    if "@".startswith(incomplete) and any(
+        r["status"] in ("awaiting_approval", "awaiting_input") for r in rows
+    ):
+        out.append(("@", "the session waiting on you"))
+    for r in rows:
+        name = r["title"] or short_cwd(r["cwd"])
+        sid = short_id(r["id"])
+        if sid.startswith(incomplete):
+            out.append((sid, f"{STATUS_SHORT[r['status']]} · {name}"))
+        elif want and name.casefold().startswith(want) and " " not in name:
+            out.append((name, f"{STATUS_SHORT[r['status']]} · {sid}"))
+    return out
+
+
 JsonOpt = Annotated[bool, typer.Option("--json", help="Machine-readable output.")]
-IdArg = Annotated[str, typer.Argument(help="Session id or unique prefix.")]
+IdArg = Annotated[
+    str,
+    typer.Argument(
+        help="Session id prefix, name, title or folder; @ for the one waiting on you.",
+        autocompletion=complete_session,
+    ),
+]
 SendIdArg = Annotated[
-    str, typer.Argument(help="Session id or prefix, or the pane id (%N) `new` printed.")
+    str,
+    typer.Argument(
+        help="Session id prefix, name or folder (@: the one waiting on you), or a %N pane id.",
+        autocompletion=complete_session,
+    ),
 ]
 
 STATUS_STYLE = {
@@ -78,7 +118,9 @@ STATUS_SHORT = {
 
 
 class DaemonError(Exception):
-    pass
+    def __init__(self, message: str, choices: list[dict[str, Any]] | None = None) -> None:
+        super().__init__(message)
+        self.choices = choices or []  # set when the id matched several sessions
 
 
 # --- daemon client ---
@@ -125,7 +167,7 @@ def _spawn_daemon() -> None:
 
 def _check(reply: dict[str, Any]) -> Any:
     if "error" in reply:
-        raise DaemonError(reply["error"]["message"])
+        raise DaemonError(reply["error"]["message"], reply["error"].get("choices"))
     return reply.get("result")
 
 
@@ -156,7 +198,37 @@ def rpc(method: str, as_json: bool, **params: Any) -> Any:
     try:
         return call(method, **params)
     except DaemonError as e:
+        if e.choices and "id" in params and not as_json and _interactive():
+            picked = pick_session(str(params["id"]), e.choices)
+            return rpc(method, as_json, **(params | {"id": picked}))
         fail(str(e), as_json)
+
+
+def resolve(ref: str, as_json: bool) -> str:
+    """The full id for what was typed (asking which one, on a terminal, if several match)."""
+    if ref.startswith("%"):
+        return ref
+    return str(rpc("tail", as_json, id=ref, n=0)["session"]["id"])
+
+
+def _interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def pick_session(ref: str, choices: list[dict[str, Any]]) -> str:
+    """Ask which of several matching sessions was meant. Only on a terminal: scripts get the
+    error, so a send never goes somewhere by guesswork."""
+    err.print(Text(f"{ref!r} matches {len(choices)} sessions:", style="yellow"))
+    for i, c in enumerate(choices, 1):
+        line = Text(f" {i:>2}  ", style="bold").append(short_id(c["id"]), style="bold")
+        line.append("  ").append_text(status_text(c["status"]))
+        line.append(f"  {c['label']}").append(f"  {short_cwd(c.get('cwd') or '')}", style="blue")
+        err.print(line)
+    answer = typer.prompt(f"which one? 1-{len(choices)}, Enter cancels", default="",
+                          show_default=False, err=True).strip()  # fmt: skip
+    if answer.isdigit() and 1 <= int(answer) <= len(choices):
+        return str(choices[int(answer) - 1]["id"])
+    raise typer.Exit(1)
 
 
 def fail(msg: str, as_json: bool) -> NoReturn:
@@ -376,23 +448,114 @@ def render(
 # --- sessions ---
 
 
+@app.callback(invoke_without_command=True)
+def main(ctx: typer.Context) -> None:
+    """Watch and drive your Claude Code, Codex and opencode sessions.
+
+    Run with no command for a short summary of what needs you."""
+    if ctx.invoked_subcommand is None:
+        out.print(summary_view(rpc("ls", False)))
+
+
+def summary_view(rows: list[dict[str, Any]]) -> Group:
+    """What `agentctl` alone prints: what needs you, what's running, and what to type next."""
+    needs = [r for r in rows if r["status"] in ("awaiting_approval", "awaiting_input")]
+    working = [r for r in rows if r["status"] == "working"]
+    unread = sum(1 for r in rows if r.get("unread"))
+    head = Text()
+    if not rows:
+        head.append("No sessions yet. ", style="bold")
+        head.append("Start one with `agentctl new claude .`, or just run claude/codex/opencode.")
+        return Group(head)
+    head.append(f"{len(needs)} need you", style="bold yellow" if needs else "dim")
+    head.append(" · ").append(f"{len(working)} working", style="green" if working else "dim")
+    head.append(" · ").append(f"{unread} with unread replies", style="cyan" if unread else "dim")
+    parts: list[Any] = [head]
+    for r in needs[:5]:
+        ref, name = short_id(r["id"]), r["title"] or short_cwd(r["cwd"])
+        line = Text("  ").append_text(status_text(r["status"])).append(f" {ref} ", style="bold")
+        line.append(name, style="")
+        if r["status"] == "awaiting_approval":
+            what = (r.get("pending_approval") or {}).get("tool") or "?"
+            line.append(f"  wants {what}", style="dim")
+            line.append(f"\n      agentctl approve {ref} · agentctl deny {ref}", style="dim")
+        else:
+            line.append(f'\n      agentctl tail {ref} · agentctl send {ref} "…"', style="dim")
+        parts.append(line)
+    if len(needs) > 5:
+        parts.append(Text(f"  and {len(needs) - 5} more: agentctl ls -m", style="dim"))
+    parts += attention_notes(rows)
+    parts.append(
+        Text("\nagentctl watch", style="bold").append(" for the dashboard · ", style="dim")
+        .append("agentctl ls", style="bold").append(" for everything · ", style="dim")
+        .append("agentctl --help", style="bold").append(" for all commands", style="dim")
+    )  # fmt: skip
+    return Group(*parts)
+
+
 @app.command()
 def ls(
     source: Annotated[str | None, typer.Option(help="claude, codex or opencode")] = None,
     status: Annotated[str | None, typer.Option(help="e.g. awaiting_approval")] = None,
     all_: Annotated[bool, typer.Option("--all", "-a", help="Include old ended sessions.")] = False,
+    needs_me: Annotated[
+        bool, typer.Option("--needs-me", "-m", help="Only those waiting for approval or input.")
+    ] = False,
+    here: Annotated[
+        bool, typer.Option("--here", help="Only sessions in this folder's git repo (or folder).")
+    ] = False,
+    watch_: Annotated[
+        bool, typer.Option("--watch", "-w", help="Keep the list up to date until Ctrl-C.")
+    ] = False,
     as_json: JsonOpt = False,
 ) -> None:
     """List sessions, those needing attention first."""
     src = SOURCES.get(source or "", source)
-    rows = rpc("ls", as_json, source=src, status=status, all=all_)
+    root = _here_root() if here else None
+
+    def rows() -> list[dict[str, Any]]:
+        got: list[dict[str, Any]] = rpc("ls", as_json, source=src, status=status, all=all_)
+        if needs_me:
+            got = [r for r in got if r["status"] in ("awaiting_approval", "awaiting_input")]
+        if root:
+            got = [r for r in got if _within(r["cwd"], root)]
+        return got
+
     if as_json:
-        print(json.dumps(rows, indent=2))
+        print(json.dumps(rows(), indent=2))
         return
+    if not watch_:
+        out.print(ls_view(rows(), out.width))
+        return
+    from rich.live import Live
+
+    try:
+        with Live(ls_view(rows(), out.width), console=out, screen=True, auto_refresh=False) as live:
+            while True:
+                time.sleep(2)
+                stamp = Text(f"\nupdated {datetime.now():%H:%M:%S} · Ctrl-C to stop", style="dim")
+                live.update(Group(ls_view(rows(), out.width), stamp), refresh=True)
+    except KeyboardInterrupt:
+        pass
+
+
+def _here_root() -> str:
+    cwd = os.getcwd()
+    r = subprocess.run(
+        ["git", "-C", cwd, "rev-parse", "--show-toplevel"], capture_output=True, text=True
+    )
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else cwd
+
+
+def _within(cwd: str, root: str) -> bool:
+    return bool(cwd) and (cwd == root or cwd.startswith(root.rstrip("/") + "/"))
+
+
+def ls_view(rows: list[dict[str, Any]], width: int) -> Group:
+    """The `ls` table plus what needs a look: counts, overlaps, quiet sessions, approvals."""
     if not rows:
-        out.print(Text("no sessions", style="dim"))
-        return
-    narrow = out.width < 70  # phone portrait: drop cwd and source, keep title
+        return Group(Text("no sessions", style="dim"))
+    narrow = width < 70  # phone portrait: drop cwd and source, keep title
     t = Table(box=None, pad_edge=False, header_style="bold dim", expand=True)
     t.add_column("ID", no_wrap=True, min_width=8, style="bold")
     if not narrow:
@@ -417,12 +580,14 @@ def ls(
             title.append(f"{r['unread']} new ", style="bold cyan")
         if r.get("conflicts"):
             title.append("! ", style="yellow")
+        if (stuck := stuck_minutes(r)) is not None:
+            title.append(f"quiet {stuck}m ", style="bold yellow")
         title.append(
             r["title"] or short_cwd(r["cwd"]), style="dim" if r["status"] == "ended" else ""
         )
         ctl = Text("●", style="green") if r["controllable"] else Text("·", style="dim")
         t.add_row(*cells, title, ctl)
-    out.print(t)
+    parts: list[Any] = [t]
     counts: dict[str, int] = {}
     for r in rows:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
@@ -430,14 +595,37 @@ def ls(
     for st in ("awaiting_approval", "awaiting_input", "working"):
         if counts.get(st):
             summary.append(f"{counts[st]} {STATUS_SHORT[st]}  ", style=STATUS_STYLE[st])
+    if stuck_n := sum(stuck_minutes(r) is not None for r in rows):
+        summary.append(f"{stuck_n} maybe stuck  ", style="bold yellow")
     summary.append("● = controllable", style="dim")
-    out.print(summary)
+    parts.append(summary)
     for r in rows:
         for c in r.get("conflicts") or []:
-            out.print(Text(f"! {short_id(r['id'])} {c}", style="yellow"))
+            parts.append(Text(f"! {short_id(r['id'])} {c}", style="yellow"))
+    parts += attention_notes(rows)
     for r in rows:
         if r["status"] == "awaiting_approval" and r["pending_approval"]:
-            out.print(approval_panel(r["id"], r["pending_approval"], r["controllable"]))
+            parts.append(approval_panel(r["id"], r["pending_approval"], r["controllable"]))
+    return Group(*parts)
+
+
+def attention_notes(rows: list[dict[str, Any]]) -> list[Text]:
+    """One line per session that looks stuck or is running out of context, with what to do."""
+    notes = []
+    for r in rows:
+        ref = short_id(r["id"])
+        if (stuck := stuck_minutes(r)) is not None:
+            notes.append(
+                Text(f"? {ref} working but no output for {stuck}m: ", style="yellow")
+                + Text(f"agentctl attach {ref}, or agentctl interrupt {ref}", style="dim")
+            )
+        if (pct := context_full(r)) is not None:
+            hint = "/compact" if r["source"] == "claude_code" else "a fresh session"
+            notes.append(
+                Text(f"? {ref} has used {pct}% of its context: ", style="yellow")
+                + Text(f"consider {hint} before the next big task", style="dim")
+            )
+    return notes
 
 
 @app.command()
@@ -449,6 +637,7 @@ def tail(
     as_json: JsonOpt = False,
 ) -> None:
     """Show a session's recent transcript, optionally live."""
+    id = resolve(id, as_json)
     try:
         it = stream("follow", id=id, n=n) if follow else iter([call("tail", id=id, n=n)])
         first = next(it)
@@ -494,10 +683,19 @@ def send(
             "Codex: steers the running turn).",
         ),
     ] = False,
+    wait_: Annotated[
+        bool,
+        typer.Option("--wait", "-w", help="Then wait for the reply, like `agentctl wait`."),
+    ] = False,
+    timeout: Annotated[
+        int, typer.Option(help="With --wait: give up after this many seconds.")
+    ] = 600,
     as_json: JsonOpt = False,
 ) -> None:
-    """Type a message into a session and press Enter. If it's mid-turn, the message is queued
-    and sent once the agent is free (--now sends it anyway)."""
+    """Type a message into a session and press Enter.
+
+    If it's mid-turn, the message is queued and sent once the agent is free (--now sends it
+    anyway)."""
     text = sys.stdin.read().rstrip("\n") if message == "-" else message
     if not text.strip():
         fail("empty message", as_json)
@@ -505,34 +703,170 @@ def send(
         r = rpc("queue", as_json, id=id, text=text)
         n = len(r["queued"])
         ok(f"queued for {short_id(r['session_id'])} ({n} waiting)", as_json, r)
+    else:
+        r = rpc("send", as_json, id=id, text=text, now=now)
+        if "queued" in r:
+            n = len(r["queued"])
+            ok(f"{short_id(r['session_id'])} is busy: queued ({n} waiting)", as_json, r)
+        else:
+            lines = text.count("\n") + 1
+            ok(
+                f"sent to {short_id(r['session_id'])}" + (f" ({lines} lines)" if lines > 1 else ""),
+                as_json,
+                r,
+            )
+    if wait_:
+        _wait(r["session_id"], timeout, quiet=False, as_json=as_json)
+
+
+@app.command()
+def wait(
+    id: IdArg,
+    timeout: Annotated[int, typer.Option(help="Give up after this many seconds.")] = 600,
+    quiet: Annotated[bool, typer.Option("--quiet", "-q", help="Don't print the reply.")] = False,
+    as_json: JsonOpt = False,
+) -> None:
+    """Wait for a session to finish its turn, then print its last reply.
+
+    Waits through queued follow-ups too. Exit status: 0 done, 2 stopped for approval,
+    3 timed out, 4 nothing was running, 5 delivery uncertain or undeliverable. The reply goes
+    to stdout and the status to stderr, so `agentctl wait api > reply.md` keeps just the reply.
+    Polls the local daemon only; no tokens are spent waiting."""
+    _wait(id, timeout, quiet, as_json)
+
+
+def _wait(ref: str, timeout: int, quiet: bool, as_json: bool) -> None:
+    ref = resolve(ref, as_json)
+    try:
+        w = wait_turn(call, ref, max(timeout, 1))
+    except DaemonError as e:
+        fail(str(e), as_json)
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    s, short = w.session, short_id(w.session["id"])
+    if as_json:
+        print(json.dumps({"outcome": w.outcome, "session_id": s["id"], "status": s["status"],
+                          "reply": w.reply, "detail": w.detail}))  # fmt: skip
+        raise typer.Exit(EXIT[w.outcome])
+    if w.outcome == "done":
+        err.print(Text("ok: ", style="bold green") + Text(f"{short} finished (now {s['status']})"))
+        if w.reply and not quiet:
+            if out.is_terminal:
+                out.print(Markdown(w.reply))
+            else:  # piped: the reply exactly as written, unwrapped
+                print(w.reply)
         return
-    r = rpc("send", as_json, id=id, text=text, now=now)
-    if "queued" in r:
-        n = len(r["queued"])
-        ok(f"{short_id(r['session_id'])} is busy: queued ({n} waiting)", as_json, r)
-        return
-    lines = text.count("\n") + 1
-    ok(
-        f"sent to {short_id(r['session_id'])}" + (f" ({lines} lines)" if lines > 1 else ""),
-        as_json,
-        r,
-    )
+    if w.outcome == "approval":
+        err.print(approval_panel(s["id"], s.get("pending_approval") or {}, s["controllable"]))
+    message = {
+        "approval": f"{short} is waiting for your approval of {w.detail}",
+        "timeout": f"timed out after {timeout}s; {short} is still {s['status']}",
+        "idle": f"{short} isn't working on anything ({s['status']})",
+        "uncertain": f"{short}: delivery uncertain; check `agentctl tail {short}` before resending",
+        "undelivered": f"{short} has undelivered work: {w.detail}",
+    }[w.outcome]
+    err.print(Text("error: ", style="bold red") + Text(message))
+    raise typer.Exit(EXIT[w.outcome])
+
+
+OptIdArg = Annotated[
+    str | None,
+    typer.Argument(
+        help="Session id prefix, name or folder; @ for the one waiting on you.",
+        autocompletion=complete_session,
+        show_default=False,
+    ),
+]
 
 
 @app.command()
 def approve(
-    id: IdArg,
+    id: OptIdArg = None,
     choice: Annotated[int | None, typer.Option(help="Pick option N instead of 1 (Yes).")] = None,
+    all_: Annotated[
+        bool, typer.Option("--all", help="Every pending request matching --tool, in any session.")
+    ] = False,
+    tool: Annotated[
+        str | None,
+        typer.Option(help="With --all: which requests, as a glob, e.g. 'Read*' or 'Bash: npm *'."),
+    ] = None,
+    here: Annotated[bool, typer.Option("--here", help="With --all: only in this repo.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="With --all: don't ask first.")] = False,
     as_json: JsonOpt = False,
 ) -> None:
-    """Answer a pending permission prompt (default: option 1, Yes)."""
+    """Answer a pending permission prompt (default: option 1, Yes).
+
+    `--all --tool PATTERN` answers every matching request at once, after showing you the list
+    (skip that with -y). There's no blanket approve: say `--tool '*'` if you mean it."""
+    if all_ or tool:
+        _answer_all(True, tool, here, yes, as_json)
+        return
+    if id is None:
+        fail("which session? an id, name or folder, or @ for the one waiting on you", as_json)
     r = rpc("approve", as_json, id=id, choice=choice, allow=True)
     ok(f"{short_id(r['session_id'])} → {r['chosen']}", as_json, r)
 
 
+def _answer_all(allow: bool, tool: str | None, here: bool, yes: bool, as_json: bool) -> None:
+    verb = "approve" if allow else "deny"
+    if not tool:
+        fail(f"say which requests to {verb}: --tool 'Read*' (or --tool '*' for every one)", as_json)
+    folder = _here_root() if here else None
+    params = {"tool": tool, "allow": allow, "folder": folder}
+    preview = rpc("approve_all", as_json, **params, dry_run=True)["matched"]
+    todo = [m for m in preview if "error" not in m]
+    if not todo:
+        if as_json:
+            print(json.dumps({"matched": preview}))
+            return
+        out.print(Text(f"nothing pending matches {tool!r}", style="dim"))
+        for m in preview:
+            out.print(Text(f"  {short_id(m['session_id'])} {m['tool']}: {m['error']}", style="dim"))
+        return
+    if not as_json:
+        out.print(
+            Text(f"{len(todo)} request{'s' if len(todo) > 1 else ''} to {verb}:", style="bold")
+        )
+        for m in todo:
+            out.print(
+                Text(f"  {short_id(m['session_id'])} ", style="bold")
+                + Text(m["tool"])
+                + Text(f"  {short_cwd(m['cwd'])}", style="blue")
+            )
+    if not yes and not as_json:
+        if not _interactive():
+            fail("pass --yes to answer these without a terminal to confirm on", as_json)
+        if not typer.confirm(f"{verb.capitalize()} all of these?", default=False):
+            raise typer.Exit(1)
+    only = [{"id": m["session_id"], "tool": m["tool"]} for m in todo]
+    done = rpc("approve_all", as_json, **params, only=only)["matched"]
+    if as_json:
+        print(json.dumps({"matched": done}))
+        return
+    for m in done:
+        if "error" in m:
+            err.print(Text(f"error: {short_id(m['session_id'])} {m['error']}", style="red"))
+        else:
+            ok(f"{short_id(m['session_id'])} → {m['chosen']}", False, m)
+
+
 @app.command()
-def deny(id: IdArg, as_json: JsonOpt = False) -> None:
-    """Reject a pending permission prompt."""
+def deny(
+    id: OptIdArg = None,
+    all_: Annotated[
+        bool, typer.Option("--all", help="Every pending request matching --tool, in any session.")
+    ] = False,
+    tool: Annotated[str | None, typer.Option(help="With --all: which requests, as a glob.")] = None,
+    here: Annotated[bool, typer.Option("--here", help="With --all: only in this repo.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="With --all: don't ask first.")] = False,
+    as_json: JsonOpt = False,
+) -> None:
+    """Reject a pending permission prompt (`--all --tool PATTERN` for several)."""
+    if all_ or tool:
+        _answer_all(False, tool, here, yes, as_json)
+        return
+    if id is None:
+        fail("which session? an id, name or folder, or @ for the one waiting on you", as_json)
     r = rpc("approve", as_json, id=id, allow=False)
     ok(f"{short_id(r['session_id'])} → {r['chosen']}", as_json, r)
 
@@ -546,7 +880,13 @@ def interrupt(id: IdArg, as_json: JsonOpt = False) -> None:
 
 @app.command()
 def attach(
-    id: Annotated[str, typer.Argument(help="Session id/prefix, or a tmux pane id like %2.")],
+    id: Annotated[
+        str,
+        typer.Argument(
+            help="Session id prefix, name or folder, or a tmux pane id like %2.",
+            autocompletion=complete_session,
+        ),
+    ],
 ) -> None:
     """Jump to the session's tmux pane (ctrl-] d detaches from agentctl's panes)."""
     if id.startswith("%"):  # a pane `new`/`adopt` opened, before its session exists
@@ -821,9 +1161,12 @@ def adopt(
     ] = False,
     as_json: JsonOpt = False,
 ) -> None:
-    """Move a session into agentctl's tmux so it can be controlled: `claude --resume <id>`,
-    `codex resume <id>` or `opencode -s <id>`. If it's open in another terminal, that process
-    is stopped first (like Ctrl-C there; asks unless -y). Then `agentctl attach <id>`."""
+    """Move a read-only session into agentctl so it can be controlled.
+
+    Resumes it with `claude --resume <id>`, `codex resume <id>` or `opencode -s <id>`. If it's
+    open in another terminal, that process is stopped first (like Ctrl-C there; asks unless
+    -y). Then `agentctl attach <id>`."""
+    id = resolve(id, as_json)
     try:
         plan = adopt_plan(id, force)
         if plan.pid and not yes:
@@ -862,8 +1205,10 @@ def queue(
 
 @app.command()
 def digest(as_json: JsonOpt = False) -> None:
-    """What happened since you last looked: per session, new replies, files touched, and the
-    start of its last reply. Opening a session (watch, or tail) marks it read."""
+    """What happened since you last looked.
+
+    Per session: new replies, files touched, and the start of its last reply. Opening a
+    session (watch, or tail) marks it read."""
     rows = rpc("digest", as_json)
     if as_json:
         print(json.dumps(rows, indent=2))
@@ -877,6 +1222,13 @@ def digest(as_json: JsonOpt = False) -> None:
         if r["files"]:
             body.append(" · touched " + ", ".join(r["files"][:6]), style="blue")
             body.append(f" +{len(r['files']) - 6}" if len(r["files"]) > 6 else "")
+        if r.get("failed_tools"):
+            n = r["failed_tools"]
+            body.append(f" · {n} failed tool call{'s' if n > 1 else ''}", style="red")
+        if r.get("stuck_minutes") is not None:
+            body.append(f" · no output for {r['stuck_minutes']}m", style="bold yellow")
+        for e in r.get("errors") or []:
+            body.append("\n✗ ", style="red").append(e, style="red")
         if r["last_reply"]:
             body.append("\n◆ ", style="green").append(r["last_reply"], style="dim")
         out.print(head)
@@ -907,8 +1259,10 @@ def usage_text(u: dict[str, Any], resets: bool = False) -> Text:
 
 @app.command()
 def usage(as_json: JsonOpt = False) -> None:
-    """Plan usage limits: 5-hour and weekly windows. Claude Code reports them to its status line
-    (agentctl wraps it); Codex writes them to its session files."""
+    """Plan usage limits: 5-hour and weekly windows.
+
+    Claude Code reports them to its status line (agentctl wraps it); Codex writes them to its
+    session files."""
     u = rpc("usage", as_json)
     if as_json:
         print(json.dumps(u, indent=2))
@@ -944,8 +1298,9 @@ def close(
     force: Annotated[bool, typer.Option(help="Even mid-turn (aborts it).")] = False,
     as_json: JsonOpt = False,
 ) -> None:
-    """Quit a session's agent (like Ctrl-C in its terminal) and close agentctl's pane for it.
-    The session stays resumable (`agentctl adopt <id>`)."""
+    """Quit a session's agent and close agentctl's pane for it.
+
+    Like Ctrl-C in its terminal. The session stays resumable (`agentctl adopt <id>`)."""
     r = rpc("close", as_json, id=id, force=force)
     ok(f"closed {short_id(r['session_id'])}", as_json, r)
 
@@ -959,9 +1314,10 @@ def mcp(
     team: Annotated[str | None, typer.Option(help="Expose only this team's scoped tools.")] = None,
     token_file: Annotated[Path | None, typer.Option(help="Private team credential file.")] = None,
 ) -> None:
-    """MCP server (stdio) so an agent can see and coordinate your other agents. Read-only
-    unless --allow-write. Never exposes approve/deny/close: those stay yours. Add it with
-    e.g. `claude mcp add -s user agentctl -- agentctl mcp`."""
+    """MCP server (stdio) so an agent can see and coordinate your other agents.
+
+    Read-only unless --allow-write. Never exposes approve/deny/close: those stay yours. Add it
+    with e.g. `claude mcp add -s user agentctl -- agentctl mcp`."""
     from agentctl.mcp import serve
 
     if bool(team) != bool(token_file):
@@ -988,7 +1344,7 @@ def watch(
         ),
     ] = None,
 ) -> None:
-    """Live dashboard. Works down to ~45 columns; `n` toggles notifications, `m` raw text."""
+    """Live dashboard. Works down to ~45 columns; `?` lists its keys."""
     from textual.theme import BUILTIN_THEMES
 
     if theme and theme not in BUILTIN_THEMES:
@@ -1056,8 +1412,10 @@ def ask(question: str, yes: bool) -> bool:
 def setup(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Accept every step.")] = False,
 ) -> None:
-    """Set agentctl up, asking before each change: Claude hooks, the launchd daemon, shell
-    aliases. Then checks phone access. Safe to re-run; `agentctl uninstall` undoes it."""
+    """Set agentctl up, asking before each change.
+
+    Installs Claude hooks, the launchd daemon and shell aliases, then checks phone access.
+    Safe to re-run; `agentctl uninstall` undoes it."""
     from agentctl import setup as su
 
     exe = _exe()
@@ -1134,8 +1492,10 @@ def setup(
 def uninstall(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Don't ask.")] = False,
 ) -> None:
-    """Undo `agentctl setup`: remove the hooks (restoring settings.json), the launchd daemon
-    and the alias block. Leaves ~/.agentctl and running agents alone."""
+    """Undo `agentctl setup`.
+
+    Removes the hooks (restoring settings.json), the launchd daemon and the alias block.
+    Leaves ~/.agentctl and running agents alone."""
     from agentctl import setup as su
 
     if not ask("Remove agentctl's hooks, daemon and aliases?", yes):
@@ -1295,8 +1655,10 @@ def daemon_restart(
 
 @daemon_app.command("install")
 def daemon_install(as_json: JsonOpt = False) -> None:
-    """Run agentctld from launchd: starts at login, and in your desktop session, so agents
-    it launches can read the Keychain (your Claude login) even when you're on SSH/mosh."""
+    """Run agentctld from launchd, starting at login.
+
+    It runs in your desktop session, so agents it launches can read the Keychain (your Claude
+    login) even when you're on SSH/mosh."""
     info = install_daemon(as_json)
     ok(f"installed {PLIST}; agentctld running under launchd (pid {info['pid']})", as_json, info)
 
@@ -1348,3 +1710,109 @@ def daemon_run(debug: Annotated[bool, typer.Option("--debug")] = False) -> None:
     from agentctl.daemon.server import main
 
     asyncio.run(main(debug=debug))
+
+
+# --- approval rules ---
+
+RULES_HELP = """\
+A rule answers matching permission prompts for you, in sessions agentctl controls:
+  agentctl rules add "allow Read*"
+  agentctl rules add "allow Bash: npm test*" --in ~/src/api
+  agentctl rules add "deny Bash: rm -rf *"
+Patterns are globs matched against the request as `ls` shows it. Deny rules win. Questions
+are never answered by a rule. Each answer is noted in the session's transcript."""
+
+
+def _print_rules(rules: list[str]) -> None:
+    if not rules:
+        out.print(Text("no approval rules: every prompt waits for you", style="dim"))
+        out.print(Text(RULES_HELP, style="dim"))
+        return
+    for i, r in enumerate(rules, 1):
+        style = "red" if r.startswith("deny") else "green"
+        out.print(Text(f"{i:>3}  ", style="bold") + Text(r, style=style))
+
+
+@rules_app.callback()
+def rules_main(ctx: typer.Context) -> None:
+    """Approval rules: answer matching permission prompts for you.
+
+    Changing them is for you only: the daemon refuses rule changes from agents."""
+    if ctx.invoked_subcommand is None:
+        _print_rules(rpc("rules", False, op="list")["rules"])
+
+
+@rules_app.command("ls")
+def rules_ls(as_json: JsonOpt = False) -> None:
+    """List the rules, numbered."""
+    r = rpc("rules", as_json, op="list")
+    if as_json:
+        print(json.dumps(r))
+    else:
+        _print_rules(r["rules"])
+
+
+@rules_app.command("add")
+def rules_add(
+    rule: Annotated[str, typer.Argument(help='e.g. "allow Read*" or "deny Bash: rm *"')],
+    in_: Annotated[
+        Path | None, typer.Option("--in", help="Only for sessions in this folder (or below).")
+    ] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Add a rule."""
+    line = rule + (f" in {in_.expanduser().resolve()}" if in_ else "")
+    r = rpc("rules", as_json, op="add", rule=line)
+    ok(f"{len(r['rules'])} rule{'s' if len(r['rules']) != 1 else ''}; added: {line}", as_json, r)
+
+
+@rules_app.command("rm")
+def rules_rm(
+    index: Annotated[int, typer.Argument(help="Its number in `agentctl rules`.")],
+    as_json: JsonOpt = False,
+) -> None:
+    """Remove a rule by number."""
+    r = rpc("rules", as_json, op="remove", index=index)
+    ok(f"removed rule {index}; {len(r['rules'])} left", as_json, r)
+
+
+@rules_app.command("test")
+def rules_test(
+    request: Annotated[str, typer.Argument(help='A request as `ls` shows it: "Bash: npm test"')],
+    in_: Annotated[Path, typer.Option("--in", help="The session's folder.")] = Path("."),
+    as_json: JsonOpt = False,
+) -> None:
+    """Which rule, if any, would answer this request."""
+    r = rpc("rules", as_json, op="test", tool=request, cwd=str(in_.expanduser().resolve()))
+    if as_json:
+        print(json.dumps(r))
+    elif r["decided_by"]:
+        style = "red" if r["decided_by"].startswith("deny") else "green"
+        out.print(Text("answered by: ") + Text(r["decided_by"], style=style))
+    else:
+        out.print(Text("no rule matches: it would wait for you", style="dim"))
+
+
+# --- help layout: group the commands in `agentctl --help` ---
+
+HELP_PANELS = {
+    "Sessions": (
+        "ls", "tail", "send", "wait", "approve", "deny", "interrupt", "attach", "rename", "close",
+    ),
+    "Start agents": ("new", "claude", "codex", "opencode", "adopt"),
+    "Catch up": ("watch", "digest", "queue", "usage"),
+    "Coordinate": ("teams", "mcp", "rules"),
+    "Setup": ("setup", "doctor", "daemon", "hooks", "uninstall"),
+}  # fmt: skip
+
+
+def _group_help() -> None:
+    panel = {name: title for title, names in HELP_PANELS.items() for name in names}
+    for c in app.registered_commands:
+        name = c.name or (c.callback.__name__ if c.callback else "")
+        c.rich_help_panel = panel.get(name, "Other")
+    for g in app.registered_groups:
+        g.rich_help_panel = panel.get(g.name or "", "Other")
+
+
+_group_help()
